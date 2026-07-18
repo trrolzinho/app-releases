@@ -1,0 +1,94 @@
+name: Build e publicar Release (TofuBot)
+
+# Dispara automaticamente sempre que uma tag de versão for empurrada pro
+# repositório (ex.: v1.4.0). Pra criar a tag e disparar o build:
+#   git tag v1.4.0
+#   git push origin v1.4.0
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Sem isso, o GITHUB_TOKEN padrão às vezes só tem permissão de LEITURA no
+# repositório (depende da configuração da organização/conta) — precisa de
+# escrita pra poder criar o Release e subir os arquivos nele.
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    # Roda num runner Windows de verdade fornecido pelo próprio GitHub —
+    # é EXATAMENTE o mesmo ambiente que o gerar_exe.bat espera, só que
+    # gratuito e sem precisar de VM/Wine na sua máquina.
+    runs-on: windows-latest
+
+    steps:
+      - name: Baixar o código deste repositório (na tag que disparou o build)
+        uses: actions/checkout@v4
+
+      - name: Preparar o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # --- Mesmos passos do gerar_exe.bat, um por um --------------------
+
+      - name: Instalar pyinstaller, telethon e certifi
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade pyinstaller telethon certifi
+
+      - name: Gerar painel.exe (--onedir)
+        run: >
+          python -m PyInstaller --onedir --windowed --name painel
+          --collect-data=certifi painel.py
+          --distpath dist --workpath build --specpath build
+
+      - name: Gerar bot.exe (--onedir)
+        run: >
+          python -m PyInstaller --onedir --console --name bot
+          --collect-data=certifi hunter.py
+          --distpath dist --workpath build --specpath build
+
+      - name: Montar a pasta final (exe + _internal + fonte .py juntos)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "TofuBot_pronto_para_enviar" | Out-Null
+          Copy-Item -Path "dist\painel\*" -Destination "TofuBot_pronto_para_enviar\" -Recurse -Force
+          Copy-Item -Path "dist\bot\*" -Destination "TofuBot_pronto_para_enviar\" -Recurse -Force
+          Copy-Item -Path "config.py" -Destination "TofuBot_pronto_para_enviar\" -Force
+          Copy-Item -Path "hunter.py" -Destination "TofuBot_pronto_para_enviar\" -Force
+          Copy-Item -Path "painel.py" -Destination "TofuBot_pronto_para_enviar\" -Force
+
+      - name: "Zipar tudo (nome baseado na tag, ex.: TofuBot_v1.4.0_release.zip)"
+        shell: pwsh
+        run: |
+          $zipName = "TofuBot_${{ github.ref_name }}_release.zip"
+          Compress-Archive -Path "TofuBot_pronto_para_enviar\*" -DestinationPath $zipName -Force
+          echo "ZIPNOME=$zipName" >> $env:GITHUB_ENV
+
+      # Se existir um CHANGELOG_vX.Y.Z.md na raiz do repo pra esta versão
+      # (mesma convenção que você já usa), usa o conteúdo dele como
+      # descrição do Release automaticamente. Se não existir, usa uma
+      # mensagem simples — não falha o build por causa disso.
+      - name: Ler o CHANGELOG desta versão (se existir)
+        id: changelog
+        shell: pwsh
+        run: |
+          $arquivo = "CHANGELOG_${{ github.ref_name }}.md"
+          if (Test-Path $arquivo) {
+            $conteudo = Get-Content -Raw -Path $arquivo
+          } else {
+            $conteudo = "Release ${{ github.ref_name }}."
+          }
+          $delim = "EOF_CHANGELOG_$([guid]::NewGuid().ToString('N'))"
+          echo "body<<$delim" >> $env:GITHUB_OUTPUT
+          echo "$conteudo" >> $env:GITHUB_OUTPUT
+          echo "$delim" >> $env:GITHUB_OUTPUT
+
+      - name: Criar o Release e subir o zip
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "TofuBot ${{ github.ref_name }}"
+          body: ${{ steps.changelog.outputs.body }}
+          files: ${{ env.ZIPNOME }}
