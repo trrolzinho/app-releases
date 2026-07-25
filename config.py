@@ -34,7 +34,7 @@ def session_path(app_dir, phone, name=None):
 # VERSION: versão DESTE build. O botão "Verificar atualização" no painel
 # compara com a versão publicada no GitHub Releases e avisa se há uma mais nova.
 # BUMP MANUAL: subir este número a cada release (ex: 1.0.0 -> 1.0.1).
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 # UPDATE_REPO: repositório do GitHub no formato "usuario/repositorio" onde ficam
 # os Releases (com o zip de atualização anexado). Vazio = botão desativado.
 UPDATE_REPO = "trrolzinho/app-releases"

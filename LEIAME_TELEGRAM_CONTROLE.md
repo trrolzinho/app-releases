@@ -35,9 +35,10 @@ novo.
 ### 4. Rodar o controle
 
 O controle roda **separado** do bot que joga — é um processo à parte, na
-MESMA pasta do `hunter.py`/`painel.py`/`config.py`.
+MESMA pasta do `hunter.py`/`painel.py`/`config.py` (ou `bot.exe`/`painel.exe`).
 
-- **Windows**: dê 2 cliques em `controle.cmd`.
+- **Windows, usando os `.exe`**: dê 2 cliques em `controle.exe`.
+- **Windows, usando os `.py`**: dê 2 cliques em `controle.cmd`.
 - **Linux**: rode `./controle.sh` no terminal.
 
 Deixe essa janela aberta (pode minimizar) — é ela que fica de olho no bot e

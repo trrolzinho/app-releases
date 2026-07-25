@@ -5470,7 +5470,9 @@ class Painel:
             rodando_como_exe = bool(getattr(sys, "frozen", False))
             novo_painel_exe = None
             novo_bot_exe = None
+            novo_controle_exe = None
             novo_internal_dir = None
+            aviso_controle = None
             aplicados = []
             for raiz, dirs, arquivos in os.walk(tmp_dir):
                 if os.path.basename(raiz) == "_internal":
@@ -5487,6 +5489,9 @@ class Painel:
                         continue
                     if nome.lower() == "bot.exe":
                         novo_bot_exe = origem
+                        continue
+                    if nome.lower() == "controle.exe":
+                        novo_controle_exe = origem
                         continue
                     if rodando_como_exe:
                         # Quem usa o .exe NUNCA recebe .py/.cmd/.sh do zip —
@@ -5508,7 +5513,8 @@ class Painel:
                 # auxiliar espera eu fechar de verdade, troca tudo (exe(s) +
                 # '_internal'), e me reabre — daí eu me fecho sozinho.
                 self.root.after(0, lambda: self._preparar_self_update_exe(
-                    novo_painel_exe, novo_bot_exe, tag, tmp_dir, novo_internal_dir))
+                    novo_painel_exe, novo_bot_exe, tag, tmp_dir, novo_internal_dir,
+                    novo_controle_exe))
                 return
 
             if novo_bot_exe:
@@ -5521,6 +5527,25 @@ class Painel:
                     shutil.copytree(novo_internal_dir, os.path.join(BASE, "_internal"),
                                     dirs_exist_ok=True)
                     aplicados.append("_internal")
+            if novo_controle_exe:
+                # controle.exe (Bot de Controle via Telegram) roda como um
+                # processo À PARTE do painel — não é "eu mesmo" rodando agora,
+                # então dá pra sobrescrever direto, igual o bot.exe. ÚNICA
+                # exceção: se a PESSOA estiver com o controle.exe aberto nesse
+                # momento, o Windows trava o arquivo — nesse caso só avisa e
+                # segue (não derruba a atualização inteira por causa disso).
+                destino_controle = os.path.join(BASE, "controle.exe")
+                try:
+                    shutil.copy2(novo_controle_exe, destino_controle)
+                    aplicados.append("controle.exe")
+                    if novo_internal_dir and "_internal" not in aplicados:
+                        shutil.copytree(novo_internal_dir, os.path.join(BASE, "_internal"),
+                                        dirs_exist_ok=True)
+                        aplicados.append("_internal")
+                except Exception:
+                    aviso_controle = ("controle.exe não pôde ser atualizado agora "
+                                       "(feche o Bot de Controle via Telegram, se estiver "
+                                       "aberto, e clique em 'Atualizar' de novo).")
             if novo_painel_exe and not rodando_como_exe:
                 # painel.exe novo baixado, mas estou rodando via python
                 # painel.py (não sou o exe) — aplica igual, sem risco de
@@ -5558,10 +5583,12 @@ class Painel:
                     importlib.reload(config)
                 except Exception:
                     pass
-            self.root.after(0, lambda: self._atualizar_fim(
-                info=f"Atualizado para a versão {tag}!\n\n"
-                     f"Arquivos trocados: {', '.join(sorted(aplicados))}\n\n"
-                     f"Feche e abra o TofuBot de novo para usar a versão nova."))
+            msg_final = (f"Atualizado para a versão {tag}!\n\n"
+                         f"Arquivos trocados: {', '.join(sorted(aplicados))}\n\n"
+                         f"Feche e abra o TofuBot de novo para usar a versão nova.")
+            if aviso_controle:
+                msg_final += f"\n\n(aviso: {aviso_controle})"
+            self.root.after(0, lambda: self._atualizar_fim(info=msg_final))
         except Exception as e:
             msg = str(e)
             self.root.after(0, lambda: self._atualizar_fim(
@@ -5574,10 +5601,12 @@ class Painel:
                 pass
 
     def _preparar_self_update_exe(self, novo_painel_exe: str, novo_bot_exe: str, tag: str,
-                                  tmp_dir: str, novo_internal_dir: str = None):
+                                  tmp_dir: str, novo_internal_dir: str = None,
+                                  novo_controle_exe: str = None):
         """Monta um .bat que espera ESTE painel.exe fechar de verdade, troca o
-        arquivo pela versão nova (e o bot.exe/pasta '_internal' também, se
-        vieram novos), reabre o painel.exe atualizado, e se autodestrói.
+        arquivo pela versão nova (e o bot.exe/controle.exe/pasta '_internal'
+        também, se vieram novos), reabre o painel.exe atualizado, e se
+        autodestrói.
         Depois disso, fecha este processo (painel.exe atual) — só então o
         .bat consegue sobrescrever os arquivos, já que o Windows mantém tudo
         que está em uso (o .exe E os arquivos dentro de '_internal', modo
@@ -5624,7 +5653,7 @@ class Painel:
             "title TofuBot - aplicando atualizacao...",
             f"echo Aguardando o TofuBot (PID {pid_atual}) fechar...",
             ":espera",
-            f'tasklist /fi "PID eq {pid_atual}" 2^>nul | find "{pid_atual}" >nul',
+            f'tasklist /fi "PID eq {pid_atual}" 2>nul | find "{pid_atual}" >nul',
             "if not errorlevel 1 (",
             "    timeout /t 1 /nobreak >nul",
             "    goto espera",
@@ -5654,6 +5683,21 @@ class Painel:
                 "    exit /b 1",
                 ")",
             ]
+        if novo_controle_exe:
+            # controle.exe roda como processo À PARTE (não é o painel.exe que
+            # este .bat já garantiu que fechou) — se a pessoa estiver com ele
+            # aberto, o copy falha; diferente de painel.exe/bot.exe isso NÃO
+            # aborta o resto da atualização (sem 'exit /b 1'), só avisa.
+            destino_controle = os.path.join(BASE, "controle.exe")
+            linhas += [
+                "echo Copiando controle.exe novo...",
+                f'copy /y "{novo_controle_exe}" "{destino_controle}"',
+                "if errorlevel 1 (",
+                "    echo [AVISO] Nao consegui copiar o controle.exe novo — feche o",
+                "    echo Bot de Controle via Telegram, se estiver aberto, e clique",
+                "    echo em 'Atualizar' de novo depois.",
+                ")",
+            ]
         if novo_internal_dir:
             # xcopy /E (com subpastas, inclusive vazias) /I (destino é pasta)
             # /Y (sobrescreve sem perguntar) — sincroniza a '_internal' nova
@@ -5670,11 +5714,29 @@ class Painel:
                 "    exit /b 1",
                 ")",
             ]
+        # BUG REAL corrigido (relatado pelo usuário: pasta de extração
+        # temporária — com hunter.py/painel.py/config.py/telegram_controle.py
+        # etc, o código-fonte inteiro — nunca era apagada em quem usa o
+        # .exe, mesmo depois da atualização "terminar"). Causa: o '^' antes
+        # do '>' em '2^>nul' só faz sentido quando o comando passa por OUTRA
+        # camada de shell antes de virar um .bat de verdade — aqui não passa,
+        # é escrito direto no arquivo. Com o '^' sobrando, o Windows trata o
+        # '>' como texto literal em vez de redirecionamento, o rmdir falha, e
+        # como não tinha 'if errorlevel 1' depois dessa linha (diferente das
+        # outras), a falha ficava 100% silenciosa. Agora, além de corrigir o
+        # '2>nul', tenta de novo por até 5s (a pasta recém-extraída pode ficar
+        # brevemente travada por antivírus).
         tmp_dir_extracao = tmp_dir
         linhas += [
             "echo.",
+            "echo Limpando arquivos temporarios da atualizacao...",
+            "for /l %%i in (1,1,5) do (",
+            f'    rmdir /s /q "{tmp_dir_extracao}" 2>nul',
+            f'    if not exist "{tmp_dir_extracao}" goto limpo',
+            "    timeout /t 1 /nobreak >nul",
+            ")",
+            ":limpo",
             "echo Atualizacao aplicada! Reabrindo o TofuBot...",
-            f'rmdir /s /q "{tmp_dir_extracao}" 2^>nul',
             f'start "" "{exe_atual}"',
             "timeout /t 2 /nobreak >nul",
             'del "%~f0"',
