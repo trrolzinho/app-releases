@@ -81,12 +81,99 @@ def norm(s: str) -> str:
 
 LOG_FILE = os.path.join(APP_DIR, "run.log")
 RELATORIO_FILE = os.path.join(APP_DIR, "relatorio.json")
+# eventos.json: fila de eventos em tempo real (item raro, morte, conta
+# travada) — pedido do usuário 2026-07-20, pros alertas automáticos do bot
+# de controle via Telegram (telegram_controle.py fica de olho neste arquivo
+# em segundo plano e manda mensagem sozinho pro grupo a cada evento novo,
+# sem precisar ninguém perguntar). Arquivo SEPARADO do relatório/status —
+# um é histórico agregado, este é só uma fila curta dos últimos eventos.
+EVENTOS_FILE = os.path.join(APP_DIR, "eventos.json")
+MAX_EVENTOS_GUARDADOS = 200   # não cresce pra sempre — só os mais recentes
+
+
+def _registrar_evento(tipo: str, **campos) -> None:
+    """Grava 1 evento em eventos.json (lê+escreve tudo de novo a cada
+    chamada, igual write_status/relatorio — sem lock; eventos raros o
+    bastante pra não ter disputa de verdade entre contas). 'tipo':
+    'item_raro' | 'morte' | 'conta_travada' | 'recorde'. Mantém só os
+    últimos MAX_EVENTOS_GUARDADOS."""
+    try:
+        if os.path.exists(EVENTOS_FILE):
+            with open(EVENTOS_FILE, encoding="utf-8") as f:
+                eventos = json.load(f) or []
+        else:
+            eventos = []
+    except Exception:
+        eventos = []
+    eventos.append({"tipo": tipo, "ts": time.time(), **campos})
+    eventos = eventos[-MAX_EVENTOS_GUARDADOS:]
+    try:
+        with open(EVENTOS_FILE, "w", encoding="utf-8") as f:
+            json.dump(eventos, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+
 SESSAO_BASELINE_FILE = os.path.join(APP_DIR, "sessao_baseline.txt")
 SESSAO_CONTINUAR_FLAG = os.path.join(APP_DIR, "sessao_continuar.flag")
+# ⏸️ Pausar 1 conta só (pedido do usuário 2026-07-23: "detecta algum bug,
+# pausa ela, termino os outros conteúdos e depois substituo os arquivos")
+# — arquivo escrito pelo Telegram (⏸️/▶️ na tela de cada conta), lido AO
+# VIVO aqui (mesmo padrão do toggle de rotação de Rugido — cache curto,
+# não precisa reiniciar o bot pra pausa valer).
+CONTAS_PAUSADAS_FILE = os.path.join(APP_DIR, "contas_pausadas.json")
+_CACHE_CONTAS_PAUSADAS = {"valor": set(), "ts": 0.0}
+
+
+def contas_pausadas_agora() -> set:
+    agora = time.time()
+    if agora - _CACHE_CONTAS_PAUSADAS["ts"] < 5.0:
+        return _CACHE_CONTAS_PAUSADAS["valor"]
+    valor = set()
+    try:
+        with open(CONTAS_PAUSADAS_FILE, encoding="utf-8") as f:
+            valor = set(json.load(f) or [])
+    except Exception:
+        pass
+    _CACHE_CONTAS_PAUSADAS["valor"] = valor
+    _CACHE_CONTAS_PAUSADAS["ts"] = agora
+    return valor
+
+
+def conta_pausada(nome: str) -> bool:
+    return nome in contas_pausadas_agora()
+
+
+def algum_membro_pausado(sessions) -> bool:
+    """Pra conteúdo em GRUPO (Masmorra/Caçada Dupla/Cripta/Templo/Fortaleza):
+    se QUALQUER conta do grupo estiver pausada, o grupo INTEIRO para no
+    próximo ponto seguro — mesma lógica do 'Parar no fim' (não dá pra
+    tirar 1 membro no meio da luta sem travar os outros, que dependem de
+    todo mundo agir junto numa barreira sincronizada)."""
+    pausadas = contas_pausadas_agora()
+    if not pausadas:
+        return False
+    return any(s.name in pausadas for s in sessions)
 # Sinal de PARADA SUAVE ("⏸ Parar no fim" do painel): o bot TERMINA o conteúdo
 # atual (masmorra/caçada/cripta) e NÃO começa o próximo. Checado só na
 # fronteira entre um conteúdo e outro — nunca interrompe no meio do combate.
 PARAR_NO_FIM_FLAG = os.path.join(APP_DIR, "parar_no_fim.flag")
+# "⏹️🚪 Parar e Sair" (pedido do usuário 2026-07-21: "quando paro o bot e
+# estou nas montanhas, na caçada dupla, se eu não atacar ou sair, fico
+# levando ataques até morrer... em todos os locais, menos nas caçadas
+# solo"): diferente do "Parar agora" (mata o processo na hora, deixando a
+# conta EXPOSTA em combate até alguém entrar e sair manualmente) e do
+# "Parar no fim" (só para DEPOIS que o conteúdo atual termina sozinho —
+# não ajuda quem quer sair JÁ), este pede pro bot sair da sala/masmorra
+# ATUAL (usando o leave_room() que já existe e já trata a tela de
+# confirmação) e SÓ DEPOIS parar de vez — sem deixar ninguém pra trás
+# levando dano à toa. Checado dentro do loop de rodada de cada conteúdo em
+# GRUPO (Masmorra/Cripta/Caçada Dupla/Templo/Fortaleza) — a Caçada Solo não
+# precisa disso: lá, sem clicar em nada, o monstro simplesmente ESPERA (não
+# tem "todo mundo já agiu, resolve a rodada" de um grupo), então não corre
+# risco de morrer só por ficar parada.
+SAIR_E_PARAR_FLAG = os.path.join(APP_DIR, "sair_e_parar.flag")
 # "🛒 Vender agora" (pedido do usuário 2026-07-15): botão no painel que
 # dispara uma venda avulsa no Mercado, sem precisar esperar o intervalo
 # automático nem ativar o Mercado de vez. Guarda um TIMESTAMP no arquivo (não
@@ -108,14 +195,66 @@ VENDER_E_SAIR_FLAG = os.path.join(APP_DIR, "vender_e_sair.flag")
 # LER_INVENTARIO_E_SAIR_FLAG pra ligar/ler/desligar sozinho.
 LER_INVENTARIO_FLAG = os.path.join(APP_DIR, "ler_inventario.flag")
 LER_INVENTARIO_E_SAIR_FLAG = os.path.join(APP_DIR, "ler_inventario_e_sair.flag")
+# "🧪 Comprar poções" (pedido do usuário 2026-07-21: "digito uma quantidade
+# e ele vai na loja e compra?") — mesmo esquema de VENDER_AGORA/
+# LER_INVENTARIO acima, mas o conteúdo do arquivo é JSON (não só um
+# timestamp) porque também precisa guardar QUAL poção e QUANTA quantidade:
+# {"ts": <float>, "tipo": "vida"|"energia", "quantidade": <int>}.
+COMPRAR_POCOES_FLAG = os.path.join(APP_DIR, "comprar_pocoes.flag")
+COMPRAR_POCOES_E_SAIR_FLAG = os.path.join(APP_DIR, "comprar_pocoes_e_sair.flag")
+
+
+def comprar_pocoes_pedido(caminho=None):
+    """Lê o pedido de compra avulsa (dict com ts/tipo/quantidade) de um
+    caminho específico, ou None se o arquivo não existir/estiver corrompido.
+    Sem 'caminho', checa os dois flags (usado só pelo modo 'liga/compra/
+    desliga' no arranque do main(), que não sabe ainda qual dos dois foi
+    criado) — 'talvez_comprar_pocoes' (bot já rodando) usa só
+    COMPRAR_POCOES_FLAG explicitamente, pra não reagir ao flag do OUTRO modo."""
+    caminhos = [caminho] if caminho else [COMPRAR_POCOES_FLAG, COMPRAR_POCOES_E_SAIR_FLAG]
+    for cam in caminhos:
+        try:
+            with open(cam, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and "ts" in d and "tipo" in d and "quantidade" in d:
+                return d
+        except Exception:
+            continue
+    return None
 
 
 def vender_agora_timestamp():
     """Lê o timestamp do pedido de venda avulsa ('🛒 Vender agora' no
-    painel), ou None se o arquivo não existir/estiver corrompido."""
+    painel/Telegram), ou None se o arquivo não existir/estiver corrompido.
+    Aceita os DOIS formatos: só o timestamp cru (formato antigo, ainda
+    escrito pelo painel) ou um JSON {"ts":..., "contas":[...]} (formato
+    novo, escrito pelo Telegram quando o usuário escolhe QUAIS contas
+    vendem — pedido do usuário 2026-07-23: "no mercado, no telegram, tem
+    vender agora só... tem como selecionar lá quem vende?")."""
     try:
         with open(VENDER_AGORA_FLAG, encoding="utf-8") as f:
-            return float(f.read().strip())
+            conteudo = f.read().strip()
+    except Exception:
+        return None
+    try:
+        return float(conteudo)          # formato antigo: timestamp puro
+    except ValueError:
+        pass
+    try:
+        d = json.loads(conteudo)        # formato novo: JSON com contas
+        return float(d.get("ts")) if isinstance(d, dict) and d.get("ts") else None
+    except Exception:
+        return None
+
+
+def vender_agora_contas():
+    """Lista de telefones que devem vender neste pedido, ou None se o
+    pedido não especificar (aí vale o padrão de sempre: todas as contas
+    marcadas em config.MERCADO_CONTAS). Ver vender_agora_timestamp."""
+    try:
+        with open(VENDER_AGORA_FLAG, encoding="utf-8") as f:
+            d = json.loads(f.read().strip())
+        return d.get("contas") if isinstance(d, dict) else None
     except Exception:
         return None
 
@@ -129,6 +268,99 @@ def ler_inventario_timestamp():
             return float(f.read().strip())
     except Exception:
         return None
+
+
+# BUG REAL corrigido 2026-07-20 (usuário: "ele foi ler os itens sem eu ter
+# marcado, nem solicitado, tá indo sozinho" — log mostrando 4 contas lendo o
+# inventário sozinhas logo após completar uma Fortaleza dos Orcs): o
+# controle de "essa conta já atendeu esse pedido" (s._ultimo_pedido_
+# inventario_atendido) só existia NA MEMÓRIA da sessão — reinicia o bot, e
+# QUALQUER clique antigo em "Ler inventário agora" (de dias atrás, ainda
+# gravado em ler_inventario.flag, que nunca era apagado) parecia um pedido
+# NOVO de novo pra cada conta, no primeiro momento livre depois do
+# reinício. Agora persiste em disco QUAIS contas já atenderam CADA
+# timestamp — sobrevive a reinício, então um pedido antigo não volta a
+# disparar sozinho.
+LER_INVENTARIO_SERVIDO_FILE = os.path.join(APP_DIR, "ler_inventario_servido.json")
+
+
+def _ler_inventario_ja_servido(nome_conta: str, pedido_ts: float) -> bool:
+    try:
+        with open(LER_INVENTARIO_SERVIDO_FILE, encoding="utf-8") as f:
+            dados = json.load(f) or {}
+    except Exception:
+        return False
+    return nome_conta in (dados.get(str(pedido_ts)) or [])
+
+
+def _marcar_ler_inventario_servido(nome_conta: str, pedido_ts: float) -> None:
+    try:
+        with open(LER_INVENTARIO_SERVIDO_FILE, encoding="utf-8") as f:
+            dados = json.load(f) or {}
+    except Exception:
+        dados = {}
+    chave = str(pedido_ts)
+    servidos = set(dados.get(chave) or [])
+    servidos.add(nome_conta)
+    # Só guarda o pedido MAIS RECENTE — evita o arquivo crescer pra sempre
+    # com timestamps velhos que ninguém mais vai perguntar.
+    dados = {chave: sorted(servidos)}
+    try:
+        with open(LER_INVENTARIO_SERVIDO_FILE, "w", encoding="utf-8") as f:
+            json.dump(dados, f)
+    except Exception:
+        pass
+
+
+# MESMO BUG do ler_inventario (2026-07-20), agora achado em 'Vender agora'
+# e 'Comprar poções' (usuário 2026-07-22: log real mostrando 5 contas
+# vendendo sozinhas logo após completar a Fortaleza dos Orcs, "não to com
+# venda do mercado ativado e nem coloquei pra vender durante a dung") — os
+# dois usavam a MESMA versão antiga, só em memória da sessão
+# (s._ultimo_pedido_venda_atendido / s._ultimo_pedido_compra_atendido), que
+# reinicia zerada a cada boot do bot. Um clique em "Vender agora"/"Comprar
+# poções" de QUALQUER dia atrás (o arquivo .flag nunca era apagado) parecia
+# um pedido NOVO de novo pra cada conta, no primeiro momento livre depois
+# de qualquer reinício. Generaliza o MESMO mecanismo de arquivo persistido
+# do ler_inventario pros outros dois.
+VENDER_AGORA_SERVIDO_FILE = os.path.join(APP_DIR, "vender_agora_servido.json")
+COMPRAR_POCOES_SERVIDO_FILE = os.path.join(APP_DIR, "comprar_pocoes_servido.json")
+# Camada EXTRA de segurança (além do arquivo "já servido" acima): qualquer
+# pedido manual com mais de 12h é tratado como EXPIRADO — protege inclusive
+# contra um flag velho que já exista OUTRA VEZ (o próprio arquivo "servido"
+# citado acima também é novo; sem esse limite, o PRIMEIRO boot depois desta
+# correção ainda dispararia 1x sozinho pra cada flag antigo pendente).
+PEDIDO_MANUAL_EXPIRA_SEG = 12 * 3600
+
+
+def _pedido_manual_expirado(pedido_ts: float) -> bool:
+    return (time.time() - pedido_ts) > PEDIDO_MANUAL_EXPIRA_SEG
+
+
+def _pedido_ja_servido(caminho_arquivo: str, nome_conta: str, pedido_ts: float) -> bool:
+    try:
+        with open(caminho_arquivo, encoding="utf-8") as f:
+            dados = json.load(f) or {}
+    except Exception:
+        return False
+    return nome_conta in (dados.get(str(pedido_ts)) or [])
+
+
+def _marcar_pedido_servido(caminho_arquivo: str, nome_conta: str, pedido_ts: float) -> None:
+    try:
+        with open(caminho_arquivo, encoding="utf-8") as f:
+            dados = json.load(f) or {}
+    except Exception:
+        dados = {}
+    chave = str(pedido_ts)
+    servidos = set(dados.get(chave) or [])
+    servidos.add(nome_conta)
+    dados = {chave: sorted(servidos)}   # só o pedido mais recente — não cresce pra sempre
+    try:
+        with open(caminho_arquivo, "w", encoding="utf-8") as f:
+            json.dump(dados, f)
+    except Exception:
+        pass
 
 # PID deste bot (multi-instância): cada PASTA é uma instância independente, e o
 # painel DESTA pasta controla SÓ o bot cujo PID está aqui.
@@ -154,6 +386,33 @@ def limpar_parar_no_fim() -> None:
         os.remove(PARAR_NO_FIM_FLAG)
     except OSError:
         pass
+
+
+def sair_e_parar_pedido() -> bool:
+    """True se o usuário clicou '⏹️🚪 Parar e Sair' (painel ou Telegram) —
+    ver SAIR_E_PARAR_FLAG."""
+    return os.path.exists(SAIR_E_PARAR_FLAG)
+
+
+def limpar_sair_e_parar() -> None:
+    try:
+        os.remove(SAIR_E_PARAR_FLAG)
+    except OSError:
+        pass
+
+
+async def _sair_e_parar_se_pedido(s: "Session") -> bool:
+    """Chamado no TOPO do loop de rodada de cada conteúdo em grupo — se
+    '⏹️🚪 Parar e Sair' foi pedido, sai da sala de verdade (leave_room, que
+    já trata a tela de confirmação) e devolve True pra quem chamou parar o
+    loop (sem tentar agir de novo). Não apaga o flag aqui de propósito — só
+    quem forma a sala/coordena o grupo (run_caca_dupla etc.) decide quando
+    o pedido foi 100% atendido por TODOS e é seguro limpar."""
+    if not sair_e_parar_pedido():
+        return False
+    log(s.name, "⏹️🚪 'Parar e Sair' pedido — saindo da sala antes de parar.")
+    await leave_room(s)
+    return True
 
 
 def _progresso_dupla_file(grupo_idx: int) -> str:
@@ -202,10 +461,51 @@ def _salvar_progresso_dupla_templo(grupo_idx: int, valor: int) -> None:
 STATUS_FILE = os.path.join(APP_DIR, "status.json")
 
 
+MODO_CONTEUDO_LABELS = {
+    "masmorra": "🏰 Masmorra", "caca_dupla": "⚔️ Caçada em Dupla",
+    "cripta": "🪦 Cripta", "caca_solo": "🗡️ Caçada Solo",
+    "missao_oasis": "🏜️ Missão Oásis", "templo_oasis": "🏛️ Templo do Oásis",
+    "fortaleza_orcs": "🏯 Fortaleza dos Orcs", "observador": "👁️ Observador",
+}
+
+
+def _status_limpar_contas(nomes: list) -> None:
+    """Limpa do status.json SÓ as entradas das contas informadas — usado no
+    início de cada conteúdo em vez de apagar o arquivo INTEIRO (pedido do
+    usuário 2026-07-22: "multi-conteúdo" — 2+ grupos rodando ao mesmo
+    tempo NO MESMO PROCESSO, cada um com suas próprias contas. Se cada
+    grupo apagasse o arquivo inteiro ao começar, um grupo apagaria o status
+    do OUTRO grupo que já estava rodando. Com 1 grupo só (uso normal, sem
+    multi-conteúdo), o efeito é idêntico ao de sempre — só que grupo por
+    grupo em vez do arquivo inteiro."""
+    if not nomes:
+        return
+    try:
+        with open(STATUS_FILE, encoding="utf-8") as f:
+            dados = json.load(f) or {}
+    except Exception:
+        return
+    mudou = False
+    for nome in nomes:
+        if nome in dados:
+            del dados[nome]
+            mudou = True
+    if mudou:
+        try:
+            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+                json.dump(dados, f)
+        except Exception:
+            pass
+
+
 def write_status(name: str, hp: int, hp_max: int, progresso: str = None,
                  hp_monstro: int = None, hp_monstro_max: int = None,
                  inicio_ts: float = None, nivel: int = None, xp_faltam: int = None,
-                 eta_proximo_nivel_seg: float = None) -> None:
+                 eta_proximo_nivel_seg: float = None, atk: int = None, defesa: int = None,
+                 crit: int = None, energia: int = None, energia_max: int = None,
+                 buff_texto: str = None, modo: str = None, monstro_nome: str = None,
+                 dupla: int = None, estoque_pocao_vida: int = None,
+                 xp_pct_nivel: float = None, xp_atual: int = None) -> None:
     """Grava o HP atual de UMA conta em status.json, pro painel desenhar a
     barra de vida. 'progresso' (opcional): texto curto tipo 'Andar 25' ou
     'Sala 2/4' — em que ponto essa conta está agora, independente do
@@ -217,7 +517,27 @@ def write_status(name: str, hp: int, hp_max: int, progresso: str = None,
     (opcionais, pedido do usuário 2026-07-15): nível atual, XP faltando pro
     próximo nível, e estimativa de tempo pra chegar lá (calculados por
     atualizar_perfil_e_estimativa, lido do Perfil periodicamente — não a
-    cada rodada, caro demais). Lê+grava tudo de novo a cada chamada (sem lock):
+    cada rodada, caro demais). 'atk'/'defesa'/'crit'/'energia'/'energia_max'/
+    'buff_texto' (opcionais, pedido do usuário 2026-07-19): também lidos na
+    mesma visita ao Perfil (ver ler_perfil) — sem custo extra de navegação.
+    'modo'/'monstro_nome'/'dupla' (opcionais, pedido do usuário 2026-07-19:
+    "mostra qual conteúdo está fazendo... agrupa a dupla 1 e a dupla 2 e
+    mostra qual mob cada 1 tá matando" no /status do Telegram): 'modo' quase
+    nunca precisa ser passado — como só um conteúdo roda por vez (ver
+    comentários em CACA_SOLO/etc.), sem informar cai sozinho no rótulo de
+    config.MODO_CONTEUDO (o mesmo pra TODAS as contas); só faz sentido
+    passar algo diferente no modo Observador, que não muda MODO_CONTEUDO.
+    'dupla' (1 ou 2) só é usado no modo Caçada em Dupla, pro Telegram
+    agrupar as duas duplas separadamente. 'estoque_pocao_vida' (opcional,
+    pedido do usuário 2026-07-20): quantas Poções de Vida essa conta tem
+    agora — vem de s.pocoes_estimadas (já existia, contado por
+    contar_pocoes_vida/pocoes_vida_ok, só nunca tinha sido persistido antes)
+    pro Telegram mostrar '🧪 Estoque de consumíveis por conta'.
+    'xp_atual' (opcional, pedido do usuário 2026-07-22: "consultar o xp
+    total do personagem"): o número exato que o jogo mostra em 'XP:' no
+    Perfil (ver ler_perfil/PERFIL_XP_RE) — mesma leitura que já alimenta
+    xp_faltam/xp_pct_nivel, só nunca tinha sido persistido antes.
+    Lê+grava tudo de novo a cada chamada (sem lock):
     como só roda em pontos síncronos do asyncio (sem 'await' no meio), não
     há disputa real entre as contas; na pior hipótese uma escrita fica velha
     por 1 rodada e se autocorrige na próxima.
@@ -225,6 +545,9 @@ def write_status(name: str, hp: int, hp_max: int, progresso: str = None,
     chega a checar se o arquivo existe."""
     if not config.STATUS_AO_VIVO_ATIVO:
         return
+    if modo is None:
+        modo = MODO_CONTEUDO_LABELS.get(getattr(config, "MODO_CONTEUDO", ""),
+                                         getattr(config, "MODO_CONTEUDO", None))
     dados = {}
     if os.path.exists(STATUS_FILE):
         try:
@@ -235,7 +558,55 @@ def write_status(name: str, hp: int, hp_max: int, progresso: str = None,
     dados[name] = {"hp": hp, "hp_max": hp_max, "progresso": progresso,
                    "hp_monstro": hp_monstro, "hp_monstro_max": hp_monstro_max,
                    "inicio_ts": inicio_ts, "nivel": nivel, "xp_faltam": xp_faltam,
-                   "eta_proximo_nivel_seg": eta_proximo_nivel_seg, "ts": time.time()}
+                   "eta_proximo_nivel_seg": eta_proximo_nivel_seg,
+                   "atk": atk, "defesa": defesa, "crit": crit,
+                   "energia": energia, "energia_max": energia_max,
+                   "buff_texto": buff_texto, "modo": modo, "monstro_nome": monstro_nome,
+                   "dupla": dupla,
+                   # Preserva o último estoque lido quando o novo é None
+                   # (write_status é chamado a cada rodada; pocoes_estimadas
+                   # só é setado antes de cada run — sem isso o campo ficava
+                   # None entre runs e o Telegram mostrava "sem estoque lido")
+                   "estoque_pocao_vida": estoque_pocao_vida
+                       if estoque_pocao_vida is not None
+                       else (dados.get(name) or {}).get("estoque_pocao_vida"),
+                   # Mesmo cuidado do estoque de poção (xp_atual só é lido
+                   # periodicamente no Perfil, não toda rodada — preserva o
+                   # último valor conhecido pra não sumir entre leituras).
+                   "xp_atual": xp_atual
+                       if xp_atual is not None
+                       else (dados.get(name) or {}).get("xp_atual"),
+                   "xp_pct_nivel": xp_pct_nivel, "ts": time.time()}
+    try:
+        with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(dados, f)
+    except Exception:
+        pass
+
+
+def write_status_extra(name: str, **campos) -> None:
+    """Grava SÓ os campos passados (kwargs — chaves de masmorra, validade do
+    VIP, elixir ativo, etc) em status.json, sem mexer no resto da entrada
+    dessa conta (hp/xp/etc, já gravados por write_status em outro ponto) —
+    usado em pontos que não coincidem com onde write_status roda (ex: o menu
+    principal, única tela onde chaves/VIP aparecem). Campos com valor None
+    são ignorados (preserva o último valor conhecido). Pedido do usuário
+    2026-07-25 (alertas '🔑 Chaves de Masmorra acabando', '👑 VIP vencendo em
+    breve' e '🍀 Elixir/Tônico expirou' no Telegram)."""
+    if not config.STATUS_AO_VIVO_ATIVO:
+        return
+    dados = {}
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, encoding="utf-8") as f:
+                dados = json.load(f)
+        except Exception:
+            dados = {}
+    entrada = dict(dados.get(name) or {})
+    for chave, valor in campos.items():
+        if valor is not None:
+            entrada[chave] = valor
+    dados[name] = entrada
     try:
         with open(STATUS_FILE, "w", encoding="utf-8") as f:
             json.dump(dados, f)
@@ -312,18 +683,28 @@ def _ler_relatorio_total_caca_solo() -> int:
     return 0
 
 
-def _somar_por_conta_diario(diario: dict, gold_por_conta: dict = None, xp_por_conta: dict = None) -> None:
-    """Acumula XP/gold POR CONTA no resumo diário (diario['por_conta']),
+def _somar_por_conta_diario(diario: dict, gold_por_conta: dict = None, xp_por_conta: dict = None,
+                             dano_por_conta: dict = None) -> None:
+    """Acumula XP/gold/dano POR CONTA no resumo diário (diario['por_conta']),
     somando TODOS os conteúdos juntos (Masmorra/Caçada/Templo/Solo/Oásis) —
     é o que alimenta 'quanto cada personagem ganhou hoje' na aba 'Por dia'
-    do relatório. 'gold_por_conta'/'xp_por_conta': dict {nome: valor} do que
-    ESSA execução específica deu (podem ter contas diferentes entre si — a
-    função trata cada dict de forma independente, não precisa bater 1:1)."""
+    do relatório, e também o ranking de dano do dia (pedido do usuário
+    2026-07-21: "faz uma somatória ao longo do dia, em todos os
+    conteúdos"). 'gold_por_conta'/'xp_por_conta'/'dano_por_conta': dict
+    {nome: valor} do que ESSA execução específica deu (podem ter contas
+    diferentes entre si — a função trata cada dict de forma independente,
+    não precisa bater 1:1). 'dano_por_conta' só existe pros modos que
+    mostram 'Ranking de dano' na tela final (Masmorra, Templo do Oásis por
+    enquanto — ver parse_ranking_dano); nos outros, passa None/vazio e
+    simplesmente não soma nada de dano pra essa execução."""
     pc = diario.setdefault("por_conta", {})
     for nome, valor in (gold_por_conta or {}).items():
         pc.setdefault(nome, {"xp": 0, "gold": 0})["gold"] += int(valor or 0)
     for nome, valor in (xp_por_conta or {}).items():
         pc.setdefault(nome, {"xp": 0, "gold": 0})["xp"] += int(valor or 0)
+    for nome, valor in (dano_por_conta or {}).items():
+        entry = pc.setdefault(nome, {"xp": 0, "gold": 0})
+        entry["dano"] = entry.get("dano", 0) + int(valor or 0)
 
 
 def _atualizar_tempo_medio(dados: dict, chave: str, duracao_segundos, manter: int = None):
@@ -347,21 +728,47 @@ def _atualizar_tempo_medio(dados: dict, chave: str, duracao_segundos, manter: in
 
 
 def _atualizar_xp_medio(dados: dict, chave: str, xp_ganho, manter: int = None):
-    """Mesma ideia de _atualizar_tempo_medio, mas pro XP ganho em CADA
-    execução concluída (mesma chave, ex: 'masmorra:Deserto Escaldante') —
-    junto com o tempo médio, dá pra calcular XP/segundo e estimar quanto
-    tempo falta pro PRÓXIMO NÍVEL de cada personagem (pedido do usuário
-    2026-07-15). Retorna a média atual, ou None se 'xp_ganho' não foi
-    informado."""
+    """Guarda o XP de UMA execução concluída numa lista rolante (só as
+    últimas 'manter' — config.MEDIA_JANELA, padrão 10) por chave — mesmo
+    padrão/motivo do _atualizar_tempo_medio (estimar quanto falta pro alvo
+    configurado), só que de XP em vez de duração. RECRIADA 2026-07-21 —
+    tinha sido perdida quando o usuário reenviou uma versão mais antiga
+    dos arquivos (a função sumiu, mas as chamadas continuaram existindo,
+    causando 'NameError' e travando o registro de masmorras/caçadas no
+    meio do processo — o que fazia a execução nunca ser salva no
+    relatório, mesmo já tendo sido concluída de verdade no jogo)."""
     if xp_ganho is None:
         return None
     if manter is None:
         manter = getattr(config, "MEDIA_JANELA", 10)
     xm = dados.setdefault("xp_medio", {})
     lst = xm.setdefault(chave, [])
-    lst.append(xp_ganho)
+    lst.append(int(xp_ganho))
     del lst[:max(0, len(lst) - manter)]
     return sum(lst) / len(lst)
+
+
+def _checar_recorde_velocidade(dados: dict, chave: str, rotulo: str, duracao_segundos) -> None:
+    """Guarda o TEMPO MAIS RÁPIDO já visto pra cada 'chave' (ex: 'masmorra',
+    'cripta', 'caca_dupla', 'templo_oasis', 'fortaleza_orcs') em
+    dados['recordes'][chave], e registra um evento 'recorde' (mesmo
+    mecanismo já usado pra item_raro/morte/conta_travada — ver
+    _registrar_evento) sempre que uma execução bate o recorde anterior —
+    só a partir da 2ª vez que essa chave aparece (a 1ª execução de sempre
+    não é 'recorde', é só o primeiro dado que existe). Pedido do usuário
+    2026-07-21: 'alerta de recorde pessoal'."""
+    if duracao_segundos is None:
+        return
+    recordes = dados.setdefault("recordes", {})
+    anterior = recordes.get(chave)
+    if anterior is None:
+        recordes[chave] = round(duracao_segundos, 1)
+        return
+    if duracao_segundos < anterior:
+        recordes[chave] = round(duracao_segundos, 1)
+        _registrar_evento("recorde", rotulo=rotulo, duracao_segundos=round(duracao_segundos, 1),
+                          duracao_anterior=anterior)
+
 
 
 def _salvar_estimativa(modo_label: str, chave_tempo: str, feitas: int, alvo: int,
@@ -452,6 +859,58 @@ def mesclar_acumulado_com_loot_final(acumulado, loot_final):
     return base
 
 
+def _registrar_drops_diario(dia_dict: dict, drops, raridades: dict = None, origem: str = None) -> None:
+    """Acumula quantos de CADA item dropou HOJE, agrupado por raridade —
+    pedido do usuário 2026-07-20 (viu isso num outro bot, 'Hit Kill', e
+    quis o mesmo aqui: '📦 Drops de hoje', por raridade, com quantidade).
+    'drops' aceita os 2 formatos que já existem no relatorio.json:
+    {jogador: [itens]} (Masmorra/Caçada em Dupla/Cripta/Templo do Oásis) OU
+    uma lista simples de nomes (Caçada Solo/Missão Oásis) — normaliza os
+    dois. 'raridades' é {nome_item: cor}, o MESMO catálogo já usado por
+    _registrar_itens_no_banco (se não vier, cai pro catálogo manual
+    config.ITENS_RARIDADE — itens tipo Alma dropam via um evento de texto
+    que NUNCA mostra a bolinha colorida de raridade, só a tela de Equipar
+    mostra, então precisam desse catálogo manual). Grava direto em
+    dia_dict['itens_hoje'] = {nome: {"qtd": N, "raridade": cor_ou_None}}.
+    AUTOCORRIGE (2026-07-21): mesmo que um registro anterior HOJE já tenha
+    ficado com raridade=None (porque ainda não existia no catálogo manual
+    naquela hora), a próxima vez que o MESMO item aparecer, o catálogo já
+    atualizado consegue corrigir o valor — antes só aplicava a raridade na
+    1ª vez que o item aparecia, ficando preso em branco pro resto do dia.
+    Também ENFILEIRA um alerta pro Telegram quando o item é Épico ou
+    Lendário — os mais raros valem um aviso na hora."""
+    if not drops:
+        return
+    if isinstance(drops, dict):
+        pares = [(nome_conta, item) for nome_conta, lista in drops.items() for item in (lista or [])]
+    else:
+        pares = [(None, item) for item in drops]
+    if not pares:
+        return
+    itens_hoje = dia_dict.setdefault("itens_hoje", {})
+    for nome_conta, item in pares:
+        if not item:
+            continue
+        info = itens_hoje.setdefault(item, {"qtd": 0, "raridade": None})
+        info["qtd"] = info.get("qtd", 0) + 1
+        cor = (raridades or {}).get(item) or getattr(config, "ITENS_RARIDADE", {}).get(item)
+        if cor:
+            info["raridade"] = cor
+            if cor in ("epico", "lendario"):
+                # Alerta em tempo real (mesmo mecanismo/tipo de evento já
+                # usado por _registrar_itens_no_banco pros itens que TÊM
+                # bolinha colorida — aqui cobre os que só têm raridade
+                # pelo catálogo manual config.ITENS_RARIDADE, tipo Almas).
+                # ÚNICO disparo de 'item_raro' pro drop (CORRIGIDO
+                # 2026-07-22: antes duplicava com _registrar_itens_no_banco
+                # — cada um mandava uma mensagem separada, uma só com o
+                # mapa, outra só com a conta). Agora uma mensagem só, com
+                # item + quem dropou + onde, tudo junto.
+                emoji = EMOJI_POR_RARIDADE.get(cor, "")
+                _registrar_evento("item_raro", item=item, raridade=cor, emoji=emoji,
+                                  conta=nome_conta or "", origem=origem or "")
+
+
 def registrar_masmorra(loot_text: str, dano: dict, acumulado: dict,
                         duracao_segundos: float = None, raridades: dict = None,
                         mapa: str = None) -> tuple:
@@ -503,6 +962,8 @@ def registrar_masmorra(loot_text: str, dano: dict, acumulado: dict,
         registro["duracao_segundos"] = round(duracao_segundos, 1)
         registro["tempo"] = _formatar_duracao(duracao_segundos)
         media_atual = _atualizar_tempo_medio(dados, chave_tempo, duracao_segundos)
+        _checar_recorde_velocidade(dados, chave_tempo,
+                                    f"Masmorra ({mapa})" if mapa else "Masmorra", duracao_segundos)
     _atualizar_xp_medio(dados, chave_tempo, xp_total)
     dados.setdefault("masmorras", []).append(registro)
     dados["masmorras"] = dados["masmorras"][-3000:]
@@ -511,7 +972,8 @@ def registrar_masmorra(loot_text: str, dano: dict, acumulado: dict,
     diario["masmorras"] = diario.get("masmorras", 0) + 1
     diario["xp_masmorra"] = diario.get("xp_masmorra", 0) + xp_total
     diario["gold_masmorra"] = diario.get("gold_masmorra", 0) + sum(gold.values())
-    _somar_por_conta_diario(diario, gold, {nome: xp_total for nome in gold})
+    _somar_por_conta_diario(diario, gold, {nome: xp_total for nome in gold}, dano)
+    _registrar_drops_diario(diario, drops, raridades, origem=f"masmorra:{mapa}" if mapa else "masmorra")
     try:
         with open(RELATORIO_FILE, "w", encoding="utf-8") as f:
             json.dump(dados, f, ensure_ascii=False, indent=2)
@@ -597,7 +1059,9 @@ def registrar_cacada(acumulado: dict = None, grupo_idx: int = 1,
     diario["xp_caca"] = diario.get("xp_caca", 0) + xp_total
     diario["gold_caca"] = diario.get("gold_caca", 0) + sum(gold.values())
     _somar_por_conta_diario(diario, gold, {nome: xp_total for nome in gold})
+    _registrar_drops_diario(diario, drops, raridades, origem="caca_dupla")
     media_atual = _atualizar_tempo_medio(dados, "caca_dupla", duracao_segundos)
+    _checar_recorde_velocidade(dados, "caca_dupla", "Caçada em Dupla", duracao_segundos)
     _salvar_relatorio(dados)
     return dados["cacadas_total"], media_atual
 
@@ -642,6 +1106,7 @@ def registrar_templo_oasis(loot_text: str, dano: dict, acumulado: dict, grupo_id
         registro["duracao_segundos"] = round(duracao_segundos, 1)
         registro["tempo"] = _formatar_duracao(duracao_segundos)
         media_atual = _atualizar_tempo_medio(dados, "templo_oasis", duracao_segundos)
+        _checar_recorde_velocidade(dados, "templo_oasis", "Templo do Oásis", duracao_segundos)
     dados.setdefault("temploses", []).append(registro)
     dados["temploses"] = dados["temploses"][-3000:]
     dia = agora.strftime("%Y-%m-%d")
@@ -649,7 +1114,8 @@ def registrar_templo_oasis(loot_text: str, dano: dict, acumulado: dict, grupo_id
     diario["templo_oasis"] = diario.get("templo_oasis", 0) + 1
     diario["xp_templo_oasis"] = diario.get("xp_templo_oasis", 0) + xp_total
     diario["gold_templo_oasis"] = diario.get("gold_templo_oasis", 0) + sum(gold.values())
-    _somar_por_conta_diario(diario, gold, {nome: xp_total for nome in gold})
+    _somar_por_conta_diario(diario, gold, {nome: xp_total for nome in gold}, dano)
+    _registrar_drops_diario(diario, drops, raridades, origem="templo_oasis")
     _salvar_relatorio(dados)
     return dados["templo_oasis_total"], media_atual
 
@@ -693,9 +1159,62 @@ def registrar_cripta(gold_por_conta: dict = None, xp_por_conta: dict = None, dro
     diario["xp_cripta"] = diario.get("xp_cripta", 0) + xp_total
     diario["gold_cripta"] = diario.get("gold_cripta", 0) + gold_total
     _somar_por_conta_diario(diario, gold_por_conta, xp_por_conta)
+    _registrar_drops_diario(diario, drops_por_conta, origem="cripta")
     media_atual = _atualizar_tempo_medio(dados, "cripta", duracao_segundos)
+    _checar_recorde_velocidade(dados, "cripta", "Cripta", duracao_segundos)
     _salvar_relatorio(dados)
     return dados["criptas_total"], media_atual
+
+
+def registrar_fortaleza_orcs(gold_por_conta: dict = None, xp_por_conta: dict = None,
+                              drops_por_conta: dict = None, duracao_segundos: float = None,
+                              tipo: str = None) -> int:
+    """Incrementa o contador de Fortalezas dos Orcs concluídas e guarda o
+    XP/gold da rodada (por conta de verdade — igual a Cripta) + soma no
+    resumo diário. Retorna (total histórico, média de tempo)."""
+    dados = _ler_relatorio()
+    dados["fortaleza_orcs_total"] = int(dados.get("fortaleza_orcs_total", 0)) + 1
+    gold_por_conta = {nome: int(v or 0) for nome, v in (gold_por_conta or {}).items()}
+    xp_por_conta = {nome: int(v or 0) for nome, v in (xp_por_conta or {}).items()}
+    drops_por_conta = {nome: list(itens) for nome, itens in (drops_por_conta or {}).items()}
+    # BUG REAL corrigido 2026-07-20 (usuário: "a xp tá errada, ele tá
+    # somando tudo e não dando individual") — diferente da Masmorra normal
+    # (cuja tela do jogo só mostra UM XP acumulado pro grupo inteiro, nunca
+    # por conta — 'xp_total' de lá já É a soma por natureza), a tela
+    # 'Resultados' da Fortaleza dos Orcs dá o MESMO prêmio, individualmente,
+    # pra CADA conta (confirmado por print do usuário: todo mundo recebe
+    # exatamente o mesmo tanto de XP/Gold). Somar as 4-5 contas juntas
+    # inflava o número (ex: 348000 = 87000 × 4) e parecia errado/grande
+    # demais pra 1 execução. Agora usa o valor de UMA conta (todas são
+    # iguais) em vez da soma.
+    xp_total = max(xp_por_conta.values()) if xp_por_conta else 0
+    gold_total = max(gold_por_conta.values()) if gold_por_conta else 0
+    agora = datetime.now()
+    registro = {
+        "n": dados["fortaleza_orcs_total"], "hora": agora.strftime("%d/%m %H:%M"),
+        "xp_total": xp_total, "gold_total": gold_total,
+        "gold": gold_por_conta, "drops": drops_por_conta, "tipo": tipo,
+    }
+    if duracao_segundos is not None:
+        registro["duracao_segundos"] = round(duracao_segundos, 1)
+        registro["tempo"] = _formatar_duracao(duracao_segundos)
+    dados.setdefault("fortaleza_orcs", []).append(registro)
+    dados["fortaleza_orcs"] = dados["fortaleza_orcs"][-3000:]
+    dia = agora.strftime("%Y-%m-%d")
+    diario = dados["diario"].setdefault(dia, {})
+    diario["fortaleza_orcs"] = diario.get("fortaleza_orcs", 0) + 1
+    # Diário/"Por dia" e "por_conta" continuam usando o valor de CADA conta
+    # de verdade (xp_por_conta/gold_por_conta, sem alterar) — só o resumo
+    # da EXECUÇÃO (registro acima, usado na tabela do Relatório) que deixou
+    # de ser a soma.
+    diario["xp_fortaleza_orcs"] = diario.get("xp_fortaleza_orcs", 0) + sum(xp_por_conta.values())
+    diario["gold_fortaleza_orcs"] = diario.get("gold_fortaleza_orcs", 0) + sum(gold_por_conta.values())
+    _somar_por_conta_diario(diario, gold_por_conta, xp_por_conta)
+    _registrar_drops_diario(diario, drops_por_conta, origem="fortaleza_orcs")
+    media_atual = _atualizar_tempo_medio(dados, "fortaleza_orcs", duracao_segundos)
+    _checar_recorde_velocidade(dados, "fortaleza_orcs", "Fortaleza dos Orcs", duracao_segundos)
+    _salvar_relatorio(dados)
+    return dados["fortaleza_orcs_total"], media_atual
 
 
 def registrar_caca_solo(nome_conta: str, xp: int = 0, gold: int = 0,
@@ -721,9 +1240,23 @@ def registrar_caca_solo(nome_conta: str, xp: int = 0, gold: int = 0,
     gold = int(gold or 0)
     drops = list(drops or [])
     agora = datetime.now()
-    dados.setdefault("caca_solo", []).append({
+    registro = {
         "n": dados["caca_solo_total"], "hora": agora.strftime("%d/%m %H:%M"),
-        "xp_total": xp, "gold": {nome_conta: gold}, "drops": {nome_conta: drops}})
+        "xp_total": xp, "gold": {nome_conta: gold}, "drops": {nome_conta: drops},
+    }
+    # ⏱️ Tempo até eliminar este mob (pedido do usuário 2026-07-23: "no
+    # relatório da caçada, coloque o tempo que levei pra eliminar o mob...
+    # é só adicionar o tempo, igual tem nos outros conteúdos" — apontando a
+    # coluna 'Tempo' que a Masmorra/Caçada em Dupla já mostram). Mesmo
+    # padrão exato usado lá: 'duracao_segundos' (valor bruto) + 'tempo'
+    # (já formatado, tipo "2min 15s") — o painel só faz r.get("tempo"),
+    # espera a string pronta. 'duracao_segundos' já vinha sendo calculado
+    # (tempo desde o ÚLTIMO kill desta MESMA conta) só pra alimentar a
+    # média (tempo_medio/xp_medio); agora também fica gravado na linha.
+    if duracao_segundos is not None:
+        registro["duracao_segundos"] = round(duracao_segundos, 1)
+        registro["tempo"] = _formatar_duracao(duracao_segundos)
+    dados.setdefault("caca_solo", []).append(registro)
     dados["caca_solo"] = dados["caca_solo"][-3000:]
     if raridades:
         _registrar_itens_no_banco(dados, raridades, origem="caca_solo")
@@ -737,6 +1270,7 @@ def registrar_caca_solo(nome_conta: str, xp: int = 0, gold: int = 0,
     diario["xp_caca_solo"] = diario.get("xp_caca_solo", 0) + xp
     diario["gold_caca_solo"] = diario.get("gold_caca_solo", 0) + gold
     _somar_por_conta_diario(diario, {nome_conta: gold}, {nome_conta: xp})
+    _registrar_drops_diario(diario, drops, raridades, origem="caca_solo")
     _salvar_relatorio(dados)
     return dados["caca_solo_total"]
 
@@ -773,6 +1307,46 @@ def registrar_morte(modo: str, nome_conta: str = "") -> None:
         entry = pc.setdefault(nome_conta, {"xp": 0, "gold": 0})
         entry["mortes"] = entry.get("mortes", 0) + 1
     _salvar_relatorio(dados)
+    # Alerta em TEMPO REAL (pedido do usuário 2026-07-20) — antes só ficava
+    # no relatório, sem avisar ninguém na hora.
+    _registrar_evento("morte", conta=nome_conta or "grupo", modo=modo)
+
+
+def registrar_dragao_derrotado(item_dropado: str = None, grupo_idx: int = 1) -> None:
+    """🐲 Dragão de Cristal de Frost (pedido do usuário 2026-07-23) — registra
+    1 derrota (SEMPRE, dropando algo ou não) + o item lendário específico,
+    se algum tiver dropado nessa vez. Guardado em relatorio.json (não no
+    resumo DIÁRIO, já que o interesse aqui é a % HISTÓRICA acumulada, não
+    "quantos hoje") — ver formatar_relatorio_dragao no telegram_controle.py."""
+    dados = _ler_relatorio()
+    d = dados.setdefault("dragao_cristal_frost", {"derrotas": 0, "drops": {}})
+    d["derrotas"] = d.get("derrotas", 0) + 1
+    if item_dropado:
+        d.setdefault("drops", {})[item_dropado] = d["drops"].get(item_dropado, 0) + 1
+    _salvar_relatorio(dados)
+    log("bot", f"🐲 Dragão de Cristal de Frost derrotado (dupla {grupo_idx})"
+               + (f" — dropou {item_dropado}!" if item_dropado else " — sem drop lendário desta vez."))
+    # Alerta em tempo real quando dropa algo (sempre — o item lendário é
+    # sempre relevante, igual aos outros "item_raro").
+    if item_dropado:
+        try:
+            _registrar_evento("item_raro", item=item_dropado, raridade="lendario",
+                              emoji="🐲", conta="", origem=f"Dragão de Cristal de Frost (dupla {grupo_idx})")
+        except Exception:
+            pass
+    # Notificação de TODA derrota, com ou sem drop (pedido do usuário
+    # 2026-07-23: "bote lá em configurações, com ela padrão desligado, pra
+    # se eu ativar, receber notificação sempre que matar um dragão") —
+    # evento SEPARADO do 'item_raro' acima (que só dispara COM drop), com
+    # toggle próprio em Configurações, default DESLIGADO (diferente dos
+    # outros alertas — matar o dragão é rotina, avisar toda vez só
+    # interessa a quem pedir explicitamente).
+    try:
+        _registrar_evento("dragao_derrotado", grupo_idx=grupo_idx,
+                          derrotas_total=d.get("derrotas", 0), item_dropado=item_dropado or "")
+    except Exception:
+        pass
+
 
 
 def registrar_missao_oasis_xp(xp: int = 0, gold: int = 0, nome_conta: str = "") -> None:
@@ -822,6 +1396,8 @@ def registrar_missao_oasis(nome_conta: str, monstro_alvo: str, recompensa: str =
     dia = agora.strftime("%Y-%m-%d")
     diario = dados["diario"].setdefault(dia, {})
     diario["missao_oasis"] = diario.get("missao_oasis", 0) + 1
+    if recompensa:
+        _registrar_drops_diario(diario, [recompensa], origem="missao_oasis")
     _salvar_relatorio(dados)
     return dados["missao_oasis_total"]
 
@@ -846,6 +1422,26 @@ def registrar_martelo_magico(nome_conta: str) -> int:
     return dados["martelo_magico_total"]
 
 
+def registrar_poeira_estelar(nome_conta: str, qtd: int = 1) -> int:
+    """Incrementa o contador de 'Poeira Estelar' coletada no Deserto
+    Escaldante (evento de sorte 'Estrela Caída!', confirmado por print do
+    usuário 2026-07-21 — 'Você coletou: 2x Poeira Estelar', quantidade
+    varia entre 1 e 3 por evento, sem precisar de ação nenhuma do bot).
+    Mesmo padrão do Martelo Mágico: total geral + por dia + por conta."""
+    qtd = max(1, int(qtd or 1))
+    dados = _ler_relatorio()
+    dados["poeira_estelar_total"] = int(dados.get("poeira_estelar_total", 0)) + qtd
+    agora = datetime.now()
+    dia = agora.strftime("%Y-%m-%d")
+    diario = dados["diario"].setdefault(dia, {})
+    diario["poeira_estelar"] = diario.get("poeira_estelar", 0) + qtd
+    pc = diario.setdefault("por_conta", {})
+    entry = pc.setdefault(nome_conta, {"xp": 0, "gold": 0})
+    entry["poeira_estelar"] = entry.get("poeira_estelar", 0) + qtd
+    _salvar_relatorio(dados)
+    return dados["poeira_estelar_total"]
+
+
 MOTIVOS_PAUSA = {
     "morte": "Um personagem morreu",
     "limite_masmorras": "Atingiu o limite de masmorras configurado",
@@ -857,13 +1453,20 @@ MOTIVOS_PAUSA = {
     "muitos_reinicios": "Muitos reinícios automáticos seguidos (possível erro repetido)",
     "parar_no_fim": "Parado a pedido (Parar no fim)",
     "travou": "Uma conta travou (flood/rede) e o grupo saiu por segurança",
+    "meta_martelos": "Atingiu a meta de Martelos Mágicos da Nurmora (Só Nurmora)",
 }
 
 
 def registrar_pausa(motivo: str, detalhe: str = "") -> None:
     """Grava em relatorio.json o motivo da ÚLTIMA pausa do bot, pro painel
     mostrar na aba Relatório (sobrescreve a pausa anterior — só a mais
-    recente importa)."""
+    recente importa). Também avisa no Telegram (pedido do usuário
+    2026-07-23: "se disparasse um pop up informando o motivo da não
+    inicialização, seria o ideal, pode ser no telegram também" — o popup
+    nativo sozinho não é confiável, ver popup_aviso: SO sem display, tela
+    bloqueada, etc.) — exceto 'morte', que já tem alerta PRÓPRIO e mais
+    detalhado (ver registrar_morte/_registrar_evento('morte', ...)),
+    então não duplica."""
     dados = _ler_relatorio()
     dados["ultima_pausa"] = {
         "motivo": motivo,
@@ -872,6 +1475,12 @@ def registrar_pausa(motivo: str, detalhe: str = "") -> None:
         "quando": datetime.now().strftime("%d/%m %H:%M"),
     }
     _salvar_relatorio(dados)
+    if motivo != "morte":
+        try:
+            _registrar_evento("bot_pausou", motivo=motivo,
+                              descricao=MOTIVOS_PAUSA.get(motivo, motivo), detalhe=detalhe)
+        except Exception:
+            pass
 
 
 # CORRIGIDO (trazido do build "só Caçada em Dupla" v1.3.7-caca, pedido do
@@ -908,14 +1517,35 @@ def log(name: str, msg: str) -> None:
 
 
 def popup_aviso(titulo: str, msg: str) -> None:
-    """Pop-up NATIVO do Windows (aviso, fica na frente). Bloqueia até o OK.
-    Silencioso em outros SO / se não der pra abrir."""
+    """Pop-up NATIVO (fica na frente, bloqueia até fechar). No Windows usa
+    MessageBoxW; em outros SO (Linux/Mac) cai pro messagebox do Tkinter —
+    CORRIGIDO 2026-07-23 (usuário, Linux: "acho que tem um aviso programado
+    pra quando falta pot de vida... mas não tá abrindo") — a versão antiga
+    só tentava `ctypes.windll` (Windows APENAS; nem existe em outro SO),
+    falhava com AttributeError, caía no except e nunca avisava nada — o
+    usuário só descobriu o motivo da pausa lendo o log na mão. Continua
+    silencioso (nunca derruba o bot) se nenhum dos dois der certo (ex:
+    processo rodando sem display nenhum, tipo servidor headless via SSH
+    puro sem X11) — mas AGORA sempre manda o aviso por Telegram também
+    (ver registrar_pausa), que não depende de SO nem de display."""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            # MB_ICONWARNING (0x30) | MB_SETFOREGROUND (0x10000) | MB_TOPMOST (0x40000)
+            ctypes.windll.user32.MessageBoxW(0, msg, titulo, 0x30 | 0x10000 | 0x40000)
+            return
+        except Exception as e:
+            log("bot", f"(não consegui abrir o pop-up nativo do Windows: {e!r})")
     try:
-        import ctypes
-        # MB_ICONWARNING (0x30) | MB_SETFOREGROUND (0x10000) | MB_TOPMOST (0x40000)
-        ctypes.windll.user32.MessageBoxW(0, msg, titulo, 0x30 | 0x10000 | 0x40000)
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showwarning(titulo, msg, parent=root)
+        root.destroy()
     except Exception as e:
-        log("bot", f"(não consegui abrir o pop-up de aviso: {e!r})")
+        log("bot", f"(não consegui abrir o pop-up de aviso — sem display disponível? {e!r})")
 
 
 # ---------------------------------------------------------------------
@@ -925,14 +1555,44 @@ def popup_aviso(titulo: str, msg: str) -> None:
 HP_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 ROOM_CODE_RE = re.compile(r"\[([A-Za-z0-9]{4,10})\]")            # lobby: "... [D1C12E]"
 ID_RE = re.compile(r"ID:\s*([A-Za-z0-9]{4,10})", re.IGNORECASE)  # combate: "ID: D1C12E"
+# Minas Abandonadas (2026-07-21): o lobby mostra o código SOLTO no título
+# ("⛏ RUÍNAS DE AZULGOR E197C9"), sem colchetes nem "ID:" — 6 caracteres
+# hex MAIÚSCULOS com pelo menos 1 dígito (o lookahead evita casar uma
+# palavra comum de 6 letras A-F; com dígito obrigatório não existe).
+CODE_SOLTO_RE = re.compile(r"\b(?=[A-F0-9]*\d)([A-F0-9]{6})\b")
+
+
+FALTA_CHAVE_ESPECIAL_RE = re.compile(
+    r"voc[eê] precisa de (\d+)\s+(.+?)\s+para criar", re.IGNORECASE)
+
+
+def _falta_chave_masmorra_especial(text: str):
+    """Detecta a mensagem 'Você precisa de N <Chave especial> para criar
+    o <Masmorra>' (ex: 'Você precisa de 1 Chave do Ossuário para criar o
+    Covil do Lord' — print do usuário 2026-07-20; a chave é comprada na
+    Loja da Cripta com Pó de Ossos). Genérico de propósito — serve pra
+    QUALQUER masmorra alternativa futura que peça uma chave especial
+    assim, não só o Covil do Lord. Segue o MESMO padrão já usado pras
+    Chaves de Masmorra normais: NÃO tenta comprar sozinho, só detecta e
+    avisa — quem chama decide pausar. Retorna a 1ª linha da tela (pra
+    logar, com acento/emoji originais) ou None se não for essa tela."""
+    if not FALTA_CHAVE_ESPECIAL_RE.search(norm(text or "")):
+        return None
+    linhas = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return linhas[0] if linhas else "chave especial insuficiente"
 
 
 def find_room_code(text: str):
-    """Código da sala: no lobby vem entre colchetes; no combate vem após 'ID:'."""
+    """Código da sala: no lobby vem entre colchetes; no combate vem após
+    'ID:'; nas Minas vem solto no título (CODE_SOLTO_RE — fallback por
+    ÚLTIMO de propósito, os 2 formatos explícitos têm prioridade)."""
     m = ROOM_CODE_RE.search(text or "")
     if m:
         return m.group(1)
     m = ID_RE.search(text or "")
+    if m:
+        return m.group(1)
+    m = CODE_SOLTO_RE.search(text or "")
     return m.group(1) if m else None
 
 
@@ -954,13 +1614,19 @@ def _nome_bate(alvo: str, texto: str) -> bool:
     — e quando o nome termina em pontuação (o '.' de 'S.') seguida de
     espaço na tela, as duas pontas são "não-palavra", sem transição
     nenhuma ali, e o \\b nunca fecha o casamento (fica sempre False).
-    Troquei por lookaround baseado em alfanumérico
-    ((?<![a-z0-9])...(?![a-z0-9])), que exige só que NENHUM caractere
-    alfanumérico esteja colado nas pontas do nome — funciona igual pra
-    nomes normais (Tom, Pri) e agora também pra nomes com pontuação no
-    final/início (Léozão S.)."""
+    BUG REAL corrigido 2026-07-20 (usuário: leitura de HP falhando direto
+    no Templo do Oásis, print confirmando a causa: a etiqueta de conta nova
+    aparece ali como 'NEWMorcequinho' — 'NEW' GRUDADO no nome, sem espaço
+    nem colchete, diferente do combate normal, que usa '[NEW]Morcequinho'
+    com colchete. Com colchete o colchete já quebra o lookbehind alfanumérico
+    sozinho; sem ele, 'w' (de NEW) colado direto em 'm' (de Morcequinho)
+    bloqueava o lookbehind pra sempre, e o nome nunca era reconhecido nessa
+    tela. Agora insere um espaço depois de um 'new' colado assim (só quando
+    grudado direto numa letra, pra não mexer em nomes reais que comecem
+    com 'new') antes de procurar o nome."""
     if not alvo:
         return False
+    texto = re.sub(r"(?<![a-z0-9])new(?=[a-z])", "new ", texto)
     return re.search(rf"(?<![a-z0-9]){re.escape(alvo)}(?![a-z0-9])", texto) is not None
 
 
@@ -1007,6 +1673,48 @@ def monster_hp(text: str):
             m = HP_RE.search(linha)
             if m:
                 return int(m.group(1)), int(m.group(2))
+    # FALLBACK (bug real reportado pelo usuário 2026-07-19, print da Caçada
+    # em Dupla em Montanhas Gélidas): esse mapa não usa 'ID:'/'HP:' por
+    # extenso — mostra só '❤️ 959 / 2123' puro, no MESMO formato do HP dos
+    # jogadores, sem nenhum texto que diferencie a linha. Mas o bloco do
+    # monstro sempre vem ANTES do separador '—' e da lista de jogadores
+    # (cada um com '⏳'/'[NEW]' na frente) — então o 1º 'X/Y' do texto
+    # inteiro é do monstro, nenhum jogador aparece antes dele nessa tela.
+    m = HP_RE.search(text or "")
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def monster_name(text: str):
+    """Nome do monstro/boss ATUAL nas telas de conteúdo em GRUPO (Masmorra/
+    Cripta/Caçada em Dupla) — mesma linha que monster_hp usa ('ID:' junto de
+    'HP:'), só que pega o texto ANTES de 'ID:' como nome (com o emoji na
+    frente removido). Pedido do usuário 2026-07-19 ('mostra qual mob cada 1
+    tá matando') pro 'Status ao vivo' do Telegram. Retorna None se não achar
+    (ex: fora de combate, ou é uma tela de conteúdo solo — ver
+    parse_monstro_nome_solo pra Caçada Solo/Missão Oásis, que usa outro
+    formato de tela, sem 'ID:')."""
+    linhas = (text or "").splitlines()
+    for linha in linhas:
+        ln = norm(linha)
+        if "id:" in ln and "hp:" in ln:
+            antes_id = re.split(r"id:", linha, maxsplit=1, flags=re.IGNORECASE)[0]
+            nome = re.sub(r"^[^\wÀ-ÿ]+", "", antes_id).strip()
+            return nome or None
+    # FALLBACK — mesmo motivo do monster_hp() acima (mapas sem 'ID:'/'HP:',
+    # ex: Montanhas Gélidas): o nome do monstro fica na linha ANTERIOR ao
+    # 1º 'X/Y' do texto (o mesmo padrão que parse_monstro_nome_solo já usa
+    # pra Caçada Solo, só que ali o monstro tb não tem 'ID:').
+    for i, linha in enumerate(linhas):
+        if HP_RE.search(linha):
+            for k in range(i - 1, -1, -1):
+                cand = linhas[k].strip()
+                if not cand:
+                    continue
+                nome = re.sub(r"^[^\wÀ-ÿ]+", "", cand).strip()
+                return nome or None
+            return None
     return None
 
 
@@ -1023,12 +1731,64 @@ def monster_hp(text: str):
 # podia "pular" pra qualquer parêntese-com-número no resto do texto inteiro.
 ANDAR_RE = re.compile(r"cacada em dupla.{0,60}?\(\s*(\d+)", re.IGNORECASE | re.DOTALL)
 ENERGIA_RE = re.compile(r"energia:\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+# 'Você precisa de 10 de energia para entrar na Caçada em Dupla' — confirmado
+# por print do usuário 2026-07-20 (ver joiner_entrar_cacada).
+ENERGIA_NECESSARIA_RE = re.compile(r"precisa de (\d+) de energia", re.IGNORECASE)
 
 
 def parse_andar(text: str):
     """Andar atual da Caçada em Dupla lido do cabeçalho, ou None se não achar."""
     m = ANDAR_RE.search(norm(text))
     return int(m.group(1)) if m else None
+
+
+# 🐲 Dragão de Cristal de Frost (pedido do usuário 2026-07-23: "meu amigo
+# adicionou uma contagem do dragão... consegue fazer um relatório sobre a
+# % de drop de cada item que lendário ele dropa") — mob [ELITE] raro da
+# Caçada em Dupla (print do usuário confirmou o texto exato: "❄️ Dragão de
+# Cristal de Frost 💀 ELITE"). Diferente da notificação do amigo (dispara
+# no ENCONTRO), aqui só conta como DERROTA de verdade — confirmado pelo
+# usuário: "vamos só até andar X, se ele aparecer no último programado,
+# não matamos, então não adianta notificação pra esse dragão" — ou seja, o
+# denominador do % de drop tem que ser derrotas de VERDADE, não avistamentos.
+DRAGAO_CRISTAL_FROST = "Dragão de Cristal de Frost"
+ITENS_DRAGAO_CRISTAL_FROST = [
+    "Báculo do Dragão de Gelo", "Arco do Dragão de Cristal",
+    "Varinha do Dragão de Gelo", "Lança do Dragão Glacial",
+    "Lâmina do Dragão Glacial", "Machado do Dragão de Cristal",
+]
+
+
+def parse_nome_mob_dupla(text: str):
+    """Nome do monstro atual na Caçada em Dupla, lido da linha logo abaixo
+    do cabeçalho '⚔️ CAÇADA EM DUPLA | <Zona> [ELITE] (<andar> 💀)' — essa
+    linha SEMPRE tem 1+ emoji na frente e, em andares de chefe, ' 💀 ELITE'
+    no fim (print do usuário: '❄️ Dragão de Cristal de Frost 💀 ELITE').
+    Tira os dois pra sobrar só o nome. None se não achar o cabeçalho ou a
+    linha seguinte estiver vazia."""
+    linhas = (text or "").splitlines()
+    for i, linha in enumerate(linhas):
+        if "cacada em dupla" not in norm(linha):
+            continue
+        for prox in linhas[i + 1:]:
+            prox = prox.strip()
+            if not prox:
+                continue
+            nome = re.sub(r"^[^\wÀ-ÿ]+", "", prox)   # tira emoji(s) do início
+            nome = re.sub(r"\s*💀\s*(elite)?\s*$", "", nome, flags=re.IGNORECASE).strip()
+            return nome or None
+        break
+    return None
+
+
+def dragao_cristal_frost_foi_derrotado(text: str) -> bool:
+    """True se a linha 'Dragão de Cristal de Frost foi derrotado!' (ou
+    variação de espaço/pontuação) aparecer no texto — mesma palavra-chave
+    'derrotado' usada em outros conteúdos (Cripta/Fortaleza), aqui
+    restrita ao NOME do dragão especificamente, pra não confundir com a
+    derrota de qualquer outro mob."""
+    nt = norm(text or "")
+    return norm(DRAGAO_CRISTAL_FROST) in nt and "derrotado" in nt
 
 
 def energia_atual(text: str):
@@ -1214,6 +1974,18 @@ def keys_count(text: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+VIP_ATE_RE = re.compile(r"vip ate (\d{2}/\d{2}/\d{4})")
+
+
+def vip_ate(text: str):
+    """Data de validade do VIP ('VIP até 22/08/2026', lido do menu principal
+    — print do usuário 2026-07-24), ou None se não achar (conta sem VIP, ou
+    tela diferente do menu principal). Formato DD/MM/AAAA, igual aparece no
+    jogo. Pedido do usuário 2026-07-25 (alerta '👑 VIP vencendo em breve')."""
+    m = VIP_ATE_RE.search(norm(text))
+    return m.group(1) if m else None
+
+
 # ---------------------------------------------------------------------
 #  CRIPTA (3º conteúdo) — parsers (trazidos da versão do colega)
 # ---------------------------------------------------------------------
@@ -1285,22 +2057,35 @@ def find_cripta_code(text: str):
 # drops no resumo final de saída) — a Cripta não tem esse resumo com lista de
 # itens, só esse log durante o combate. Aceita "um"/"uma" antes do nome.
 ENCONTROU_ITEM_CRIPTA_RE = re.compile(r"(.+?)\s+encontrou\s+um[a]?\s+(.+?)!", re.IGNORECASE)
+# BUG REAL corrigido 2026-07-20 (usuário: "foi dropado alma da masmorra
+# nova, no fosso e não foi contabilizado" — Almas dropam com um VERBO
+# DIFERENTE do resto dos itens: "Nome obteve 🛡️ Item! (ALMA)" em vez de
+# "Nome encontrou um/uma Item!" — o regex acima só cobria o 2º formato,
+# então Almas passavam batidas tanto na Cripta quanto na Fortaleza dos Orcs
+# (que reaproveita esse mesmo leitor). Sem "um/uma"; tem um EMOJI antes do
+# nome (o ícone do item) e um "!" opcional antes da tag "(ALMA)"/"(alma)"
+# no fim — confirmado por print do usuário 2026-07-20 ('Panda obteve 🛡️
+# Muralha Orc! (ALMA)'). O emoji é removido na hora de montar o par
+# (nome, item) logo abaixo, igual já era feito pro NOME do personagem.
+OBTEVE_ITEM_CRIPTA_RE = re.compile(r"(.+?)\s+obteve\s+(.+?)!?(?:\s*\(alma\))?$", re.IGNORECASE)
 
 
 def parse_drops_evento_cripta(text: str):
     """Lê a seção 'Eventos:' da tela de combate da Cripta e devolve
     [(nome_personagem, item), ...] de linhas tipo '[NEW]Pri encontrou um
-    Saco das Almas!'. O próprio evento já diz QUEM encontrou (confirmado
-    pelo usuário 2026-07-11) — antes isso era descartado e o drop virava um
-    'balaio' só do grupo; agora dá pra atribuir à conta certa, igual XP/gold.
-    Quem CHAMA é responsável por deduplicar entre as várias contas do grupo
-    (todas veem o MESMO evento) — ver combat_loop_cripta."""
+    Saco das Almas!' OU 'Panda obteve 🛡️ Muralha Orc! (ALMA)' (Almas usam
+    esse 2º formato — ver OBTEVE_ITEM_CRIPTA_RE). O próprio evento já diz
+    QUEM encontrou (confirmado pelo usuário 2026-07-11) — antes isso era
+    descartado e o drop virava um 'balaio' só do grupo; agora dá pra
+    atribuir à conta certa, igual XP/gold. Quem CHAMA é responsável por
+    deduplicar entre as várias contas do grupo (todas veem o MESMO evento)
+    — ver combat_loop_cripta."""
     pares = []
     for linha in (text or "").splitlines():
-        m = ENCONTROU_ITEM_CRIPTA_RE.search(linha)
+        m = ENCONTROU_ITEM_CRIPTA_RE.search(linha) or OBTEVE_ITEM_CRIPTA_RE.search(linha)
         if m:
             nome = re.sub(r"^[^\wÀ-ÿ\[\{]+", "", m.group(1)).strip()
-            item = m.group(2).strip()
+            item = re.sub(r"^[^\wÀ-ÿ]+", "", m.group(2).strip()).strip()
             if nome and item:
                 pares.append((nome, item))
     return pares
@@ -1346,6 +2131,152 @@ def parse_saida_cripta(text: str):
     xp = int(re.sub(r"[.,]", "", mxp.group(1))) if mxp else 0
     gold = int(re.sub(r"[.,]", "", mgold.group(1))) if mgold else 0
     return xp, gold
+
+
+# --- MINAS ABANDONADAS NAS MONTANHAS (pedido do usuário 2026-07-21) -------
+# Tela final: "🏆 RUÍNAS DE AZULGOR — COMPLETA! / Varkrul foi derrotado! /
+# ✨ <char> encontrou <item>! (lendário) / 📊 Resultados: / <char>: /
+# 📘 91500 XP | 💰 9900 Gold / ..." (print do usuário). XP/Gold são IGUAIS
+# pra todos (recompensa da masmorra) e SÓ aparecem aqui — durante o combate
+# não há blocos de recompensa por mob, então o acumulado normal fica vazio
+# e esta tela é a fonte única do registro.
+
+MINAS_LINHA_XP_RE = re.compile(r"([\d.,]+)\s*XP\s*\|.{0,4}?([\d.,]+)\s*Gold", re.IGNORECASE)
+# CORRIGIDO 2026-07-23 (usuário: "notei que o bot não detecta o totem, e
+# ele tem essa raridade" — print mostrando "Fulano encontrou um Totem
+# Obscuro!" SEM nenhum "(raridade)" no final, diferente de "encontrou
+# Broquel de Varkrul! (lendário)", que TEM) — nesta tela, só itens
+# LENDÁRIOS ganham o "(raridade)" entre parênteses; os de raridade mais
+# baixa (Épico, Raro, etc) não, então o regex antigo (que EXIGIA o
+# parênteses) simplesmente não reconhecia a linha inteira. Agora o
+# parênteses é OPCIONAL — quando ausente, parse_resultado_minas cai no
+# catálogo manual (config.ITENS_RARIDADE) pra saber a raridade. Também
+# ficou tolerante ao artigo "um/uma" (presente antes de "Totem Obscuro",
+# ausente antes de "Broquel de Varkrul" no mesmo print) — sem isso, o
+# artigo entraria junto no nome do item e não bateria com o catálogo.
+MINAS_DROP_RE = re.compile(r"(.+?)\s+encontrou\s+(?:um[a]?\s+)?(.+?)!(?:\s*\((\w+)\))?",
+                          re.IGNORECASE)
+
+
+def _nome_compacto(texto: str) -> str:
+    """normaliza + colapsa espaços — pra comparar nomes de personagem que
+    vêm com emoji/colchetes no meio ('✨ [NEW] Death Shield' vs a linha de
+    resultados 'NEW Death Shield:')."""
+    return " ".join(norm(texto or "").split())
+
+
+def parse_resultado_minas(text: str):
+    """Lê a tela final das Minas e devolve (acumulado, raridades) no MESMO
+    formato do shared['acumulado'] ({'xp_total', 'jogadores': {nome:
+    {'gold', 'drops'}}}), ou None se a tela não bater. O XP entra 1x em
+    xp_total (é o mesmo pra todo mundo, como nas masmorras normais)."""
+    if "completa" not in norm(text or ""):
+        return None
+    jogadores = {}
+    xp_total = 0
+    nome_pend = None
+    for linha in (text or "").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        m = MINAS_LINHA_XP_RE.search(linha)
+        if m and nome_pend:
+            try:
+                xp = int(re.sub(r"[.,]", "", m.group(1)))
+                gold = int(re.sub(r"[.,]", "", m.group(2)))
+            except ValueError:
+                nome_pend = None
+                continue
+            jogadores[nome_pend] = {"gold": gold, "drops": []}
+            xp_total = max(xp_total, xp)
+            nome_pend = None
+        elif linha.endswith(":") and "resultado" not in norm(linha):
+            nome_pend = linha[:-1].strip()
+    raridades = {}
+    for linha in (text or "").splitlines():
+        m = MINAS_DROP_RE.search(linha)
+        if not m:
+            continue
+        quem_compacto = _nome_compacto(re.sub(r"[^\w\s]", " ", m.group(1)))
+        item = m.group(2).strip()
+        # Raridade explícita na tela (só itens LENDÁRIOS ganham "(raridade)"
+        # aqui — ver comentário do MINAS_DROP_RE acima) — sem isso, cai no
+        # catálogo manual (config.ITENS_RARIDADE), mesmo mecanismo já usado
+        # pras Almas da Fortaleza dos Orcs.
+        if m.group(3):
+            raridades[item] = norm(m.group(3))   # "lendário" -> "lendario"
+        else:
+            raridade_catalogo = getattr(config, "ITENS_RARIDADE", {}).get(item)
+            if raridade_catalogo:
+                raridades[item] = raridade_catalogo
+        dono = next((nome for nome in jogadores
+                     if _nome_compacto(nome) and _nome_compacto(nome) in quem_compacto), None)
+        if dono is None:
+            # não bateu com ninguém dos Resultados — cria a chave assim
+            # mesmo pra NÃO PERDER o drop (o mapeamento nome->apelido lá na
+            # frente mantém como veio se não reconhecer; ver
+            # _mapear_nomes_para_conta)
+            dono = m.group(1).strip().strip("✨🏆🎁[] ").strip() or "?"
+            jogadores.setdefault(dono, {"gold": 0, "drops": []})
+        jogadores[dono]["drops"].append(item)
+    if not jogadores:
+        return None
+    return {"xp_total": xp_total, "jogadores": jogadores}, raridades
+
+
+# --- FORTALEZA DOS ORCS (pedido do usuário 2026-07-20) --------------------
+# Grupo (1 a 5), sala SEM senha (igual à Cripta), mas NÃO é infinita: são
+# sempre 3 salas + 1 sala de BOSS, terminando sozinha na tela "... —
+# COMPLETA!" — confirmado por prints do usuário (Fosso de Provas, 18/07).
+FORTALEZA_TIPO_BOTAO = {
+    "fosso_de_provas": "Fosso de Provas",
+    "trono_khargath": "Trono de Khar'gath",
+}
+FORTALEZA_CODIGO_RE = re.compile(
+    r"(fosso de provas|trono de khar.?gath)\s+([A-Za-z0-9]{4,10})", re.IGNORECASE)
+
+
+def find_fortaleza_code(text: str):
+    """Código da sala da Fortaleza dos Orcs no lobby (ex: 'FOSSO DE PROVAS
+    0E8D36', confirmado por print do usuário)."""
+    m = FORTALEZA_CODIGO_RE.search(text or "")
+    if m:
+        return m.group(2)
+    return find_room_code(text)   # tenta os formatos genéricos ([code]/ID:)
+
+
+def is_fortaleza_completa(text: str) -> bool:
+    """Tela final de vitória da Fortaleza dos Orcs ('🏆 FOSSO DE PROVAS —
+    COMPLETA! / Dregthar, o Dono do Fosso foi derrotado!', confirmado por
+    print do usuário)."""
+    n = norm(text or "")
+    return "completa" in n and ("fosso de provas" in n or "trono de khar" in n)
+
+
+def parse_resultados_fortaleza(text: str):
+    """Lê o bloco 'Resultados:' da tela final da Fortaleza dos Orcs
+    (confirmado por print do usuário — 1 nome por linha terminando em ':',
+    seguido de uma linha com XP e Gold) e devolve
+    {nome_personagem: (xp, gold)}."""
+    resultados = {}
+    nome_atual = None
+    for linha in (text or "").splitlines():
+        l = linha.strip()
+        if not l:
+            continue
+        ln = norm(l)
+        if l.endswith(":") and "xp" not in ln and "gold" not in ln:
+            nome_atual = re.sub(r"^[^\wÀ-ÿ]+", "", l[:-1]).strip()
+            continue
+        if nome_atual:
+            m = re.search(r"([\d.,]+)\s*xp", ln)
+            mg = re.search(r"([\d.,]+)\s*gold", ln)
+            if m or mg:
+                xp = int(re.sub(r"[.,]", "", m.group(1))) if m else 0
+                gold = int(re.sub(r"[.,]", "", mg.group(1))) if mg else 0
+                resultados[nome_atual] = (xp, gold)
+                nome_atual = None
+    return resultados
 
 
 DEATH_WORDS = ("morreu", "foi derrotado", "caiu em combate", "tombou", "foi morto",
@@ -1410,17 +2341,58 @@ def someone_died(text: str, nomes=None) -> bool:
     return False
 
 
+def linha_morte_detectada(text: str, nomes=None):
+    """Mesma lógica exata do someone_died acima, mas devolve a LINHA (texto
+    cru) que disparou a detecção, em vez de só True/False — pra logar QUEM
+    morreu de verdade (pedido do usuário 2026-07-22: log real mostrando só
+    'morte detectada no grupo', sem nome nenhum, então não dava pra saber
+    se foi o tank, um DPS, ou investigar por quê). None se não achar nada
+    (não deveria acontecer se someone_died() já retornou True antes, mas
+    defensivo mesmo assim)."""
+    alvos = [norm(x) for x in (nomes or []) if x]
+    if not alvos:
+        if any(w in norm(text) for w in DEATH_WORDS):
+            for linha in (text or "").splitlines():
+                if any(w in norm(linha) for w in DEATH_WORDS):
+                    return linha.strip()
+    else:
+        linhas = (text or "").splitlines()
+        for i, linha in enumerate(linhas):
+            nl = norm(linha)
+            if "id:" in nl:
+                continue
+            if not any(a in nl for a in alvos):
+                continue
+            if any(w in nl for w in DEATH_WORDS):
+                return linha.strip()
+            proxima = norm(linhas[i + 1]).strip() if i + 1 < len(linhas) else ""
+            proxima_limpa = re.sub(r"^[^\wÀ-ÿ]+", "", proxima).strip()
+            if proxima_limpa == "eliminado":
+                return f"{linha.strip()} / {linhas[i + 1].strip()}"
+    for linha in (text or "").splitlines():
+        nl = norm(linha)
+        if "id:" in nl:
+            continue
+        if "❤" in linha or "hp:" in nl:
+            m = HP_RE.search(linha)
+            if m and int(m.group(1)) == 0:
+                return linha.strip()
+    return None
+
+
 def damage_to_me(text: str, char_name: str) -> int:
     """
     Dano que o monstro causou EM MIM nesta tela, pelo log de eventos —
-    reconhece DOIS formatos diferentes (confirmado por print do usuário
-    2026-07-16, a Cripta usa um formato diferente da Masmorra/Caçada):
+    reconhece TRÊS formatos diferentes:
       1) '<Monstro> causa X em <MeuNome>'                  (Masmorra/Caçada)
       2) '<MeuNome> defendeu/atacou e recebeu X de dano'   (Cripta)
+      3) '<MeuNome> recebeu X de dano'                     (Minas/Lago de
+         Kryos — confirmado por print do usuário 2026-07-23, SEM nenhum
+         verbo antes de 'recebeu', diferente do formato 2 da Cripta)
     BUG REAL corrigido: 'levou X de dano' nunca aparecia no log da Cripta
     porque essa função só reconhecia o formato 1 — a Cripta nunca usa
     'causa X em Y', sempre usa o formato 2. Retorna o maior valor encontrado
-    (entre os dois formatos), ou 0."""
+    (entre os três formatos), ou 0."""
     if not text or not char_name:
         return 0
     alvo = norm(char_name)
@@ -1430,6 +2402,9 @@ def damage_to_me(text: str, char_name: str) -> int:
         if _nome_bate(alvo, norm(m.group(2))):
             maior = max(maior, int(m.group(1)))
     for m in re.finditer(r"([^\n*]+?)\s+\w+\s+e\s+recebeu\s+(\d+)\s+de\s+dano", nt):
+        if _nome_bate(alvo, norm(m.group(1))):
+            maior = max(maior, int(m.group(2)))
+    for m in re.finditer(r"([^\n*]+?)\s+recebeu\s+(\d+)\s+de\s+dano", nt):
         if _nome_bate(alvo, norm(m.group(1))):
             maior = max(maior, int(m.group(2)))
     return maior
@@ -1453,14 +2428,50 @@ RANKING_LINHA_RE = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 
+def _extrair_itens_recompensa(resto_bruto: str) -> list:
+    """Separa o texto depois do XP de uma linha 'Recompensas (vs Mob)' em
+    UM OU MAIS itens. BUG REAL reportado pelo usuário 2026-07-25 (print do
+    'Drops de hoje' mostrando 'Broquel Silencioso,  💪 Escudo de Ossos' como
+    se fosse o nome de 1 item só, quando são 2 itens DIFERENTES — 'Escudo
+    de Ossos' inclusive já existia certinho, sozinho, no banco): quando o
+    jogo dropa 2 itens NO MESMO kill, os dois vêm na mesma linha, separados
+    por vírgula, cada um com seu próprio ícone colado na frente (raridade
+    e/ou classe/atributo, tipo o 💪 antes do 2º). A versão antiga tratava a
+    linha inteira como o nome de 1 item, só limpando o ícone do INÍCIO da
+    string inteira — o ícone do 2º item ficava preso no meio do nome
+    junto. Agora separa por vírgula PRIMEIRO, e limpa cada pedaço
+    individualmente (raridade + qualquer ícone colado), preservando a
+    raridade de CADA item separadamente. Retorna [{"nome", "raridade"}, ...]
+    (lista vazia se não tinha nenhum item / só 'Nenhum item')."""
+    itens = []
+    for pedaco in (resto_bruto or "").split(","):
+        pedaco = pedaco.strip().lstrip("⚪•· ").strip()
+        raridade = next((r for emoji, r in EMOJI_RARIDADE.items() if emoji in pedaco), None)
+        for emoji in EMOJI_RARIDADE:   # tira o emoji de raridade do nome do item
+            pedaco = pedaco.replace(emoji, "").strip()
+        # BUG REAL corrigido (print do usuário 2026-07-15: 'Arco de Caça'
+        # e outros aparecendo DUPLICADOS no banco de itens): sobrava um
+        # emoji de CLASSE da arma (🏹🗡️🪓📖✨...) colado no início do nome
+        # nessa fonte de captura, e só ali — a tela de Vender já limpava
+        # isso certinho (_item_venda_info), então o mesmo item virava 2
+        # chaves diferentes no banco ('Arco de Caça' e '🏹Arco de Caça').
+        # Tira qualquer caractere que não seja letra/número do começo.
+        pedaco = re.sub(r"^[^\wÀ-ÿ]+", "", pedaco).strip()
+        if pedaco and "nenhum item" not in norm(pedaco):
+            itens.append({"nome": pedaco, "raridade": raridade})
+    return itens
+
+
 def parse_recompensas(text: str):
     """Lê TODOS os blocos 'Recompensas (vs X): ...' presentes no texto.
-    Retorna lista de {"monstro": str, "jogadores": [{"nome","gold","xp","item","raridade"}]}.
-    'item' é None quando a linha diz 'Nenhum item'. 'raridade' vem da
-    bolinha colorida antes do item (ver EMOJI_RARIDADE, definido mais abaixo
-    mas resolvido em tempo de execução) — cada SALA de uma masmorra de
-    várias salas (ex: Pirâmide do Deserto) tem seu próprio drop com sua
-    própria cor, mostrado na passagem pra sala seguinte, então essa raridade
+    Retorna lista de {"monstro": str, "jogadores": [{"nome","gold","xp","itens"}]}.
+    'itens' é uma LISTA de {"nome","raridade"} — pode vir vazia (nenhum
+    item), com 1, ou com 2+ quando o jogo dropa mais de um item no mesmo
+    kill (ver _extrair_itens_recompensa). 'raridade' vem da bolinha
+    colorida antes do item (ver EMOJI_RARIDADE, definido mais abaixo mas
+    resolvido em tempo de execução) — cada SALA de uma masmorra de várias
+    salas (ex: Pirâmide do Deserto) tem seu próprio drop com sua própria
+    cor, mostrado na passagem pra sala seguinte, então essa raridade
     precisa ser capturada AQUI (não só na tela final do chefe)."""
     blocos = []
     linhas = (text or "").splitlines()
@@ -1481,21 +2492,8 @@ def parse_recompensas(text: str):
             gold = int(lm.group(2))
             xp = int(lm.group(3))
             resto_bruto = (lm.group(4) or "").strip()
-            raridade = next((r for emoji, r in EMOJI_RARIDADE.items() if emoji in resto_bruto), None)
-            resto = resto_bruto.lstrip("⚪•· ").strip()
-            for emoji in EMOJI_RARIDADE:   # tira o emoji de raridade do nome do item
-                resto = resto.replace(emoji, "").strip()
-            # BUG REAL corrigido (print do usuário 2026-07-15: 'Arco de Caça'
-            # e outros aparecendo DUPLICADOS no banco de itens): sobrava um
-            # emoji de CLASSE da arma (🏹🗡️🪓📖✨...) colado no início do nome
-            # nessa fonte de captura, e só ali — a tela de Vender já limpava
-            # isso certinho (_item_venda_info), então o mesmo item virava 2
-            # chaves diferentes no banco ('Arco de Caça' e '🏹Arco de Caça').
-            # Tira qualquer caractere que não seja letra/número do começo.
-            resto = re.sub(r"^[^\wÀ-ÿ]+", "", resto).strip()
-            item = None if not resto or "nenhum item" in norm(resto) else resto
-            jogadores.append({"nome": nome, "gold": gold, "xp": xp, "item": item,
-                              "raridade": raridade if item else None})
+            itens = _extrair_itens_recompensa(resto_bruto)
+            jogadores.append({"nome": nome, "gold": gold, "xp": xp, "itens": itens})
             j += 1
         if jogadores:
             blocos.append({"monstro": monstro, "jogadores": jogadores})
@@ -1507,7 +2505,8 @@ def _recompensa_hash(bloco) -> str:
     """Assinatura estável de um bloco de recompensa, pra não contar 2x o
     mesmo evento enquanto ele continuar visível no log em rodadas seguintes."""
     partes = [bloco["monstro"]] + [
-        f'{j["nome"]}:{j["gold"]}:{j["xp"]}:{j["item"]}' for j in bloco["jogadores"]
+        f'{j["nome"]}:{j["gold"]}:{j["xp"]}:' + ",".join(it["nome"] for it in j.get("itens") or [])
+        for j in bloco["jogadores"]
     ]
     return hashlib.md5("|".join(partes).encode("utf-8")).hexdigest()
 
@@ -1536,10 +2535,10 @@ def atualizar_recompensas(shared, text: str) -> None:
         for j in bloco["jogadores"]:
             pj = acumulado["jogadores"].setdefault(j["nome"], {"gold": 0, "drops": []})
             pj["gold"] += j["gold"]
-            if j["item"]:
-                pj["drops"].append(j["item"])
-                if j.get("raridade"):
-                    raridades[j["item"]] = j["raridade"]
+            for it in j.get("itens") or []:
+                pj["drops"].append(it["nome"])
+                if it.get("raridade"):
+                    raridades[it["nome"]] = it["raridade"]
 
 
 RESUMO_CACA_HEADER_RE = re.compile(r"resumo da cacada em dupla", re.IGNORECASE)
@@ -1586,6 +2585,13 @@ def _registrar_itens_no_banco(dados: dict, raridades: dict, origem: str = None) 
             origens = entry.setdefault("origens", [])
             if origem not in origens:
                 origens.append(origem)
+        # O alerta em tempo real de item raro SAIU daqui (CORRIGIDO
+        # 2026-07-22: usuário viu o MESMO drop chegar 2x no Telegram — uma
+        # vez com 'masmorra:Lago de Kryos', outra com 'conta: Morcequinho'.
+        # Essa duplicação vinha de _registrar_itens_no_banco E
+        # _registrar_drops_diario disparando CADA UMA o próprio evento pro
+        # mesmo drop. Agora só _registrar_drops_diario dispara — e já com
+        # a conta E a origem juntas na mesma mensagem, ver lá embaixo.
     dados.setdefault("raridades", {}).update(raridades)
 
 
@@ -2040,8 +3046,16 @@ class Session:
         self.tank_alma_ratio = 0.60    # HP (0-1) abaixo do qual o TANK usa alma na caçada
         self.tonico = (acc.get("tonico") or "")   # "forca" / "defesa" / "" (nenhum)
         self._prox_tonico = 0.0        # próximo time.time() de usar o tônico (0 = na 1ª vez)
-        self.elixir = (acc.get("elixir") or "")   # "" / "normal" / "super" (Elixir de Sabedoria)
+        self.elixir = (acc.get("elixir") or "")   # "" / "normal" / "super" (Sabedoria) / "fortuna" (Fortuna, +Drop)
         self._prox_elixir = 0.0        # próximo time.time() de usar o elixir (0 = na 1ª vez)
+        # "imediato" (de sempre, bebe assim que o intervalo passa) ou "boss"
+        # (segura o elixir e só bebe quando o boss ATUAL estiver quase morto
+        # — ver try_elixir/config.ELIXIR_BOSS_HP_PCT). Pedido do usuário
+        # 2026-07-24: numa masmorra longa (~30min), beber o elixir logo no
+        # início desperdiça boa parte do buff antes dela acabar. Vale pros 3
+        # tipos (não só Sabedoria) — pedido do usuário 2026-07-24: "o elixir
+        # da fortuna é um elixir, [...] não tem pq serem separados".
+        self.elixir_modo = (acc.get("elixir_modo") or "imediato")
         # Dict de "batimento" de combate (shared da masmorra / estado da dupla /
         # da cripta). Enquanto está EM COMBATE, cada leitura de tela publica o
         # horário em _combat_hb["em_combate"][self.name] — assim uma rodada com
@@ -2149,6 +3163,30 @@ class Session:
         return await self.click(b, label=label or subs[0], timeout=timeout)
 
     async def send_start(self):
+        """Manda '/start' pro bot — SEMPRE o último recurso (só chamado depois
+        de _tentar_evitar_start e dos cliques normais falharem). BANIMENTO
+        REAL confirmado em produção (2026-07-18): loops de retry (ex:
+        open_masmorra) chamavam send_start de novo a cada volta do loop sem
+        esperar o suficiente pro jogo processar o '/start' anterior — o
+        ACTION_DELAY (0.15s) é curto de propósito pra ser ágil depois de um
+        clique comum, não pra proteger contra flood de '/start'. Resultado:
+        4-5 '/start' saíam em sequência rápida pra MESMA conta, e o Telegram
+        baniu por flood. Agora impõe um intervalo mínimo entre '/start'
+        consecutivos (config.START_COOLDOWN_SEG) — se chamado de novo antes
+        disso, NÃO manda outro: só espera o resto do cooldown e dá mais uma
+        chance de refresh (o chamador reavalia a tela normalmente depois)."""
+        agora = time.time()
+        ultimo = getattr(self, "_ultimo_start_ts", 0.0)
+        cooldown = max(0.0, getattr(config, "START_COOLDOWN_SEG", 20.0))
+        espera = cooldown - (agora - ultimo)
+        if espera > 0:
+            log(self.name, f"⏳ /start pedido de novo cedo demais (faltam {espera:.0f}s "
+                        f"pro cooldown) — esperando em vez de mandar outro (evita "
+                        f"flood/banimento).")
+            await asyncio.sleep(espera)
+            await self.refresh()
+            return
+        self._ultimo_start_ts = time.time()
         await self.client.send_message(self.bot, "/start")
         await asyncio.sleep(config.ACTION_DELAY)
         await self.refresh()
@@ -2227,7 +3265,24 @@ async def open_masmorra(s: Session):
         if await _tentar_evitar_start(s):
             continue
         await s.send_start()
-    return find_button(s.message, "criar sala", "buscar salas") is not None
+    achou = find_button(s.message, "criar sala", "buscar salas") is not None
+    if not achou:
+        # DIAGNÓSTICO (2026-07-19, relato do usuário: "a Pri se perdeu, na
+        # criação da masmorra" — as 5 tentativas terminaram rápido demais
+        # (~5s) pra ser a mesma lentidão de API vista nas contas vizinhas
+        # (11-12s por refresh); mais provável é uma tela sem nenhum botão
+        # reconhecido, caindo em /start sem sair do lugar. Loga o texto
+        # cru + botões da tela final, pra confirmar a causa na próxima vez
+        # em vez de chutar um fix.
+        # Silenciado por padrão (pedido do usuário 2026-07-22: "tem como
+        # tirar os debugs? não tem mais nenhum bug que estamos investigando
+        # e eles só estão poluindo os logs") — reativa com
+        # LOG_DEBUG_VERBOSE=true no settings.json se precisar investigar de novo.
+        if getattr(config, "LOG_DEBUG_VERBOSE", False):
+            log(s.name, f"🔎 DEBUG open_masmorra esgotou as tentativas — "
+                        f"botões: {button_texts(s.message)!r} — "
+                        f"1ªs linhas da tela: {(s.text or '').splitlines()[:6]!r}")
+    return achou
 
 
 async def host_create_room(s: Session, senha: str, abrir=None):
@@ -2253,8 +3308,35 @@ async def host_create_room(s: Session, senha: str, abrir=None):
     # (checada à parte, antes de chegar aqui) decide o que a sala vira.
     b_alt = find_button(s.message, alt["botao"]) if (alt and alt.get("botao")) else None
     b_normal = find_button(s.message, "masmorra normal")
+    # DIAGNÓSTICO (2026-07-20, usuário: Covil do Lord "ainda não foi" — o
+    # log mostrou que o clique em 'Com senha' falhou, com a tela ainda
+    # sendo a de ESCOLHA ('Covil do Lord'/'Cripta do Cemitério'), como se
+    # o clique no tipo não tivesse mudado nada). Mostra se 'alt'/'b_alt'
+    # foram achados de verdade antes de tentar clicar.
+    # Silenciado por padrão (ver LOG_DEBUG_VERBOSE) — usado nas Minas
+    # Abandonadas/Fortaleza dos Orcs, já validado em produção.
+    if getattr(config, "LOG_DEBUG_VERBOSE", False):
+        log(s.name, f"🔎 DEBUG host_create_room: tipo='{tipo}' alt={'achado' if alt else None} "
+                    f"b_alt={'achado' if b_alt else None} botões atuais: {button_texts(s.message)!r}")
     if alt and b_alt:
         await s.click(b_alt, label=alt["rotulo"])
+        await s.refresh()
+        if getattr(config, "LOG_DEBUG_VERBOSE", False):
+            log(s.name, f"🔎 DEBUG depois de clicar '{alt['rotulo']}' — "
+                        f"botões: {button_texts(s.message)!r} — "
+                        f"1ªs linhas: {(s.text or '').splitlines()[:4]!r}")
+        falta = _falta_chave_masmorra_especial(s.text)
+        if falta:
+            log(s.name, f"🔑 {falta} — não vou tentar comprar sozinho (mesmo "
+                        f"critério das Chaves de Masmorra normais). Pausando.")
+            # BUG REAL evitado 2026-07-20 (Covil do Lord, chave especial):
+            # devolver None aqui SEM marcar nada faria o chamador (main())
+            # tratar como falha TRANSITÓRIA -> "reinício automático" ->
+            # LOOP infinito (reiniciar não cria chave nenhuma sozinho).
+            # Marca a sessão pra quem chama saber que é isso e PAUSAR de
+            # vez (igual falta de Poção de Vida), não reiniciar à toa.
+            s._falta_chave_especial = falta
+            return None
     elif b_normal:
         await s.click(b_normal, label="Masmorra Normal")
     # Em alguns mapas (ex: Planície/Zul'gor), escolher o tipo só MARCA a
@@ -2264,10 +3346,17 @@ async def host_create_room(s: Session, senha: str, abrir=None):
     # sala" se essa tela ainda aparecer.
     if find_button(s.message, "criar sala"):
         await s.click_text("criar sala", label="Criar sala")
-    await s.click_text("com senha", label="Com senha")
-    if not await type_password(s, senha):
-        return None
-    await s.refresh()
+    if alt and alt.get("sem_senha"):
+        # MINAS (2026-07-21): clicar no botão da mina JÁ cria a sala, SEM
+        # senha — não existe tela "Com senha" nem teclado. Só confirma o
+        # lobby e lê o código (que nas Minas vem SOLTO no título, sem
+        # colchetes — ver fallback CODE_SOLTO_RE em find_room_code).
+        await s.refresh()
+    else:
+        await s.click_text("com senha", label="Com senha")
+        if not await type_password(s, senha):
+            return None
+        await s.refresh()
     code = find_room_code(s.text)
     if code:
         log(s.name, f"✅ sala criada. Código: {code}")
@@ -2285,18 +3374,33 @@ async def joiner_enter_room(s: Session, code: str, senha: str, abrir=None):
         return False
     await s.click_text("buscar salas", label="Buscar salas")
     # procura, paginando com "Próximo" se preciso, o botão que contém o código
+    # (nas Minas o botão é "🚪 Entrar em <mina> [CÓDIGO]" — contém o código,
+    # então o mesmo matching serve). Se a sala ainda não apareceu na lista
+    # (o host acabou de criar), o botão "🔄 Atualizar" recarrega ela.
+    achou = False
     for _ in range(10):
         alvo = find_button(s.message, code)
         if alvo:
             await s.click(alvo, label=f"sala {code}")
+            achou = True
             break
         prox = find_button(s.message, "proximo", "próximo")
         if prox:
             await s.click(prox, label="Próximo")
-        else:
-            log(s.name, f"❌ não achei a sala {code} na lista.\n"
-                        f"    botões: {button_texts(s.message)}")
-            return False
+            continue
+        atualizar = find_button(s.message, "atualizar")
+        if atualizar:
+            await s.click(atualizar, label="Atualizar")
+            await poll_sleep()
+            await s.refresh()
+            continue
+        log(s.name, f"❌ não achei a sala {code} na lista.\n"
+                    f"    botões: {button_texts(s.message)}")
+        return False
+    if not achou:
+        log(s.name, f"❌ sala {code} não apareceu na lista mesmo depois de "
+                    f"várias atualizações.")
+        return False
     # pode aparecer o teclado de senha
     if find_button(s.message, "1") and find_button(s.message, "2"):
         if not await type_password(s, senha):
@@ -2411,11 +3515,18 @@ async def ready_up(s: Session):
     await s.click_text("pronto", label="Pronto", required=True)
 
 
-async def host_start(s: Session, n_expected: int):
-    """HOST: espera todos prontos e clica Iniciar."""
+async def host_start(s: Session, n_expected: int, nomes_nossos=None):
+    """HOST: espera todos prontos e clica Iniciar.
+    'nomes_nossos' (opcional — salas SEM senha, ex: Minas Abandonadas,
+    pedido do usuário 2026-07-21: "se atentar se tem intruso"): lista dos
+    char_names do grupo; se aparecer no lobby um personagem de FORA,
+    devolve "intruso" SEM iniciar — quem chama sai da sala e recria."""
     deadline = asyncio.get_event_loop().time() + config.LOBBY_TIMEOUT
     while asyncio.get_event_loop().time() < deadline:
         await s.refresh()
+        if nomes_nossos and intruso_na_sala(s.text, nomes_nossos):
+            log(s.name, "🚫 INTRUSO no lobby (sala sem senha) — não vou iniciar.")
+            return "intruso"
         ready = lobby_ready_count(s.text)
         if ready >= n_expected:
             log(s.name, f"Todos prontos ({ready}/{n_expected}). Iniciando!")
@@ -2525,17 +3636,34 @@ async def leave_room(s: Session, tentativas: int = 6) -> bool:
     log(s.name, "🚪 saindo da sala.")
     for tentativa in range(tentativas):
         await s.refresh()
+        # BUG REAL corrigido 2026-07-21 (usuário: Cripta terminou no andar-
+        # limite, as 4 contas travaram tentando confirmar a saída — nenhuma
+        # delas viu 'progresso acumulado' depois, XP/Gold ficaram de fora
+        # do relatório — print do usuário mostrou que essa tela JÁ mostra
+        # o XP/Gold, na hora da CONFIRMAÇÃO ('Tem certeza que deseja
+        # sair?'), antes até de clicar em confirmar). Antes só se tentava
+        # capturar esse texto DEPOIS de leave_room() já ter desistido —
+        # tarde demais se, nesse meio tempo, a tela tiver mudado (por
+        # qualquer motivo, incluindo o próprio botão de confirmar não
+        # bater mais com o texto esperado). Agora guarda assim que vê,
+        # ainda DENTRO do próprio retry — não depende de sair com sucesso.
+        if "progresso acumulado" in norm(s.text):
+            s._saida_txt = s.text
         b = find_button(s.message, "sair")
         if b:
             await s.click(b, label="Sair")
             await asyncio.sleep(config.ACTION_DELAY)
             await s.refresh()
+            if "progresso acumulado" in norm(s.text):
+                s._saida_txt = s.text
         # tela de confirmação: "✅ Sim, sair e receber..." / "❌ Cancelar"
         conf = find_button(s.message, "sim, sair", "sim sair")
         if conf:
             await s.click(conf, label="Sim, sair")
             await asyncio.sleep(config.ACTION_DELAY)
             await s.refresh()
+            if "progresso acumulado" in norm(s.text):
+                s._saida_txt = s.text
         # CONFIRMA de verdade: nem o botão 'Sair', nem a tela de confirmação,
         # nem o próprio HP aparecendo mais no grupo (ainda dentro da sala).
         ainda_na_sala = (find_button(s.message, "sair") is not None
@@ -2742,11 +3870,13 @@ async def act_potion(s: Session) -> bool:
     # poção" sem o HP nunca subir). Agora tenta até 3 vezes, só desiste de
     # verdade se o HP realmente não mudar em NENHUMA tentativa.
     hp_antes = player_hp(s.text, s.char)
+    hp_confirmado = False
     for tentativa in range(3):
         await s.click(pot, label=pot.text, timeout=_confirm_timeout(s))
         hp_depois = player_hp(s.text, s.char)
         se_subiu = (hp_antes is None or hp_depois is None or hp_depois[0] > hp_antes[0])
         if se_subiu:
+            hp_confirmado = True
             break
         log(s.name, f"⚠️ bebi a poção mas o HP não subiu (tentativa {tentativa + 1}/3) "
                     f"— o clique pode não ter registrado, tentando de novo.")
@@ -2755,6 +3885,22 @@ async def act_potion(s: Session) -> bool:
             log(s.name, "⚠️ não achei mais o botão da Poção de Vida pra tentar de novo.")
             break
         pot = pot_novo
+    # BUG REAL 2026-07-20 (log do usuário: trol/nati beberam poção 2x
+    # seguidas sem o HP subir — incluindo um erro real do Telegram no meio
+    # ('Encrypted data invalid') — o botão sumiu, as 3 tentativas se
+    # esgotaram SEM NUNCA confirmar a cura, e mesmo assim a função voltava
+    # True no final. Quem chamou (_act_tank/_act_other) via isso como "já
+    # curou, rodada resolvida" e não tentava mais nada — a conta ficava
+    # agindo sem HP confirmado por várias rodadas seguidas até morrer.
+    # Agora, se NENHUMA tentativa confirmou o HP subindo de verdade, volta
+    # pra tela principal do combate (por segurança — pode ter ficado presa
+    # nalgum popup/confirmação) e retorna False, pra quem chamou saber que
+    # a cura NÃO foi confirmada e agir de novo na mesma rodada (em vez de
+    # ficar parado achando que já resolveu).
+    if not hp_confirmado:
+        log(s.name, "⚠️ desisti de confirmar a poção — HP nunca subiu em nenhuma tentativa.")
+        await go_back(s)
+        return False
     # CHECAGEM da caçada no ato de curar: usa a contagem REAL (senão, o estimado).
     if s.pocao_minima_caca:
         base = qtd if qtd is not None else s.pocoes_estimadas
@@ -2902,30 +4048,42 @@ async def try_tonico(s: Session) -> bool:
 
 
 def find_elixir_button(message, tipo: str):
-    """Acha o botão do elixir certo — 'normal' ou 'super'. Cuidado: "elixir de
-    sabedoria" é SUBSTRING de "super elixir de sabedoria", então uma busca
-    simples por substring pegaria o Super quando eu queria o normal (e
-    vice-versa nunca acontece, mas o contrário sim). Aqui filtra excluindo
-    'super' quando o tipo pedido é o normal."""
+    """Acha o botão do elixir certo — 'normal'/'super' (Sabedoria) ou
+    'fortuna'. Cuidado: "elixir de sabedoria" é SUBSTRING de "super elixir de
+    sabedoria", então uma busca simples por substring pegaria o Super quando
+    eu queria o normal (e vice-versa nunca acontece, mas o contrário sim).
+    Aqui filtra excluindo 'super' quando o tipo pedido é o normal. O Elixir
+    da Fortuna não tem versão Super (confirmado pelo usuário 2026-07-24,
+    print da loja só mostra 'Elixir da Fortuna'), então não precisa desse
+    filtro."""
+    alvo = "elixir da fortuna" if tipo == "fortuna" else "elixir de sabedoria"
     for b in iter_buttons(message):
         bt = norm(b.text)
-        if "elixir de sabedoria" not in bt:
+        if alvo not in bt:
             continue
+        if tipo == "fortuna":
+            return b
         eh_super = "super" in bt
         if (tipo == "super") == eh_super:
             return b
     return None
 
 
+ELIXIR_NOME_LEGIVEL = {
+    "normal": "Elixir de Sabedoria", "super": "Super Elixir de Sabedoria",
+    "fortuna": "Elixir da Fortuna",
+}
+
+
 async def act_elixir(s: Session) -> bool:
-    """Abre Consumíveis e usa o Elixir de Sabedoria (normal OU Super,
-    conforme s.elixir). Mesma navegação do Super Tônico (Consumíveis direto
-    no combate, ou Menu -> Inventário -> Consumíveis fora dele) — só muda o
-    item procurado."""
-    tipo = s.elixir   # "normal" ou "super"
+    """Abre Consumíveis e usa o elixir configurado (Sabedoria normal/Super,
+    ou Fortuna, conforme s.elixir). Mesma navegação do Super Tônico
+    (Consumíveis direto no combate, ou Menu -> Inventário -> Consumíveis
+    fora dele) — só muda o item procurado."""
+    tipo = s.elixir   # "normal" / "super" / "fortuna"
     if not tipo:
         return False
-    nome_legivel = "Super Elixir de Sabedoria" if tipo == "super" else "Elixir de Sabedoria"
+    nome_legivel = ELIXIR_NOME_LEGIVEL.get(tipo, "Elixir")
     if not await s.click_text("consumiveis", "consumíveis", label="Consumíveis"):
         if not await s.click_text("inventario", "inventário", label="Inventário"):
             return False
@@ -2960,37 +4118,58 @@ async def act_elixir(s: Session) -> bool:
     return True
 
 
+# Indicador ATIVO no menu: Sabedoria mostra '+50% XP (29min)', Fortuna mostra
+# '+50% Drop (29min)' (print do usuário 2026-07-24) — mesmo formato, só muda
+# a palavra do efeito.
 ELIXIR_ATIVO_RE = re.compile(r"\+\s*\d+\s*%\s*xp\s*\(\s*(\d+)\s*min\s*\)", re.IGNORECASE)
+FORTUNA_ATIVO_RE = re.compile(r"\+\s*\d+\s*%\s*drop\s*\(\s*(\d+)\s*min\s*\)", re.IGNORECASE)
 
 
-def elixir_ativo_minutos(text: str):
-    """Minutos restantes do Elixir de Sabedoria (normal ou Super) — o
-    indicador que aparece no MENU quando está ATIVO ('+50% XP (29min)') tem
-    o MESMO formato pros dois (só muda a % de XP) — ou None se não achar (só
-    aparece no menu, não durante o combate)."""
-    m = ELIXIR_ATIVO_RE.search(norm(text or ""))
+def elixir_ativo_minutos(text: str, tipo: str = "normal"):
+    """Minutos restantes do elixir ATIVO — Sabedoria (normal/Super, mesmo
+    formato pros dois, só muda a % de XP) usa o indicador '% XP', Fortuna usa
+    '% Drop'. Retorna None se não achar (só aparece no menu, não durante o
+    combate)."""
+    regex = FORTUNA_ATIVO_RE if tipo == "fortuna" else ELIXIR_ATIVO_RE
+    m = regex.search(norm(text or ""))
     return int(m.group(1)) if m else None
 
 
 async def try_elixir(s: Session) -> bool:
-    """Usa o Super Elixir de Sabedoria SE já passou o intervalo (30 min,
-    diferente do Tônico que é 10 min). CONSOME a rodada quando usa de
-    verdade (mesma correção do Tônico — ver try_tonico). Se a conta não
-    tiver essa opção marcada, ou ainda não deu o tempo, retorna False (segue
-    a ação normal igual).
-    Se a tela ATUAL mostrar o indicador '+50% XP (Xmin)' (só aparece no
-    menu), confia NELE em vez do cronômetro interno — mesma lógica do
-    Tônico (tonico_ativo_minutos)."""
+    """Usa o elixir configurado (Sabedoria normal/Super, ou Fortuna) SE já
+    passou o intervalo (30 min, diferente do Tônico que é 10 min — mesma
+    duração pros 3 tipos). CONSOME a rodada quando usa de verdade (mesma
+    correção do Tônico — ver try_tonico). Se a conta não tiver essa opção
+    marcada, ou ainda não deu o tempo, retorna False (segue a ação normal
+    igual).
+    Se a tela ATUAL mostrar o indicador de ativo (só aparece no menu), confia
+    NELE em vez do cronômetro interno — mesma lógica do Tônico
+    (tonico_ativo_minutos).
+    Com s.elixir_modo == "boss" (pedido do usuário 2026-07-24), só bebe
+    quando o boss ATUAL (monster_hp) estiver com HP% <= config.
+    ELIXIR_BOSS_HP_PCT (1% por padrão) — segura o elixir o combate INTEIRO
+    até faltar pouco pro boss morrer, pra render o buff quase todo DEPOIS do
+    fim da masmorra em vez de gastar boa parte dele durante ela. Sem leitura
+    de HP do boss nesse momento (None, ou tela fora de combate), simplesmente
+    não bebe ainda — não seta cooldown, só tenta de novo na próxima rodada."""
     if not s.elixir:
         return False
-    minutos = elixir_ativo_minutos(s.text)
+    minutos = elixir_ativo_minutos(s.text, s.elixir)
     if minutos is not None:
+        # Só aparece no MENU (nunca durante o combate) — aproveita pra
+        # alimentar o alerta '🍀 Elixir/Tônico expirou' do Telegram (ver
+        # write_status_extra/elixir_ativo), sem custo extra de navegação.
+        write_status_extra(s.name, elixir_ativo=(minutos > 0))
         if minutos > 0:
             s._prox_elixir = time.time() + minutos * 60
             return False
         # indicador sumiu/zerou: segue pra usar de novo, ignora o cronômetro
     elif time.time() < s._prox_elixir:
         return False
+    if s.elixir_modo == "boss":
+        hp = monster_hp(s.text)
+        if not hp or hp[1] <= 0 or (hp[0] / hp[1]) > config.ELIXIR_BOSS_HP_PCT:
+            return False
     if await act_elixir(s):
         s._prox_elixir = time.time() + config.ELIXIR_INTERVALO
         return True
@@ -3031,6 +4210,115 @@ class Brain:
         self.rugido_usado_na_rodada = None   # nº da rodada em que "Rugido do
                                               # Rochedo" foi CONFIRMADO usado
                                               # (ver ESCUDO_REQUER_RUGIDO abaixo)
+        # Rotação de Rugido entre 2+ tanks (pedido do usuário 2026-07-21,
+        # Minas: "vou com 2 tanks, quando tiver acabando o aggro de um, o
+        # outro usa rugido") — ver _tanks_rotacao/_rotacao_rugido_minha_vez.
+        self._rugido_seq_visto = 0        # última "geração" de Rugido observada
+        self._rugido_round_visto = None   # MINHA rodada quando observei essa geração
+
+    _ROTACAO_RUGIDO_CACHE = {"valor": True, "ts": 0.0}
+
+    def _rotacao_rugido_ativa(self) -> bool:
+        """Lê TANK_ROTACAO_RUGIDO_ATIVA direto do settings.json (não do
+        config carregado no BOOT, que só é lido 1x no início do processo) —
+        pra o toggle do Telegram valer NA HORA, sem precisar reiniciar o
+        bot no meio de uma masmorra em andamento (pedido do usuário
+        2026-07-22: "a rotação do rugido deixou o conteúdo mais lento...
+        tem como colocar um botão pra ativar e desativar?"). Cache de 5s
+        (compartilhado entre todos os Brain do processo, via atributo de
+        classe) pra não reabrir o arquivo em TODA rodada de TODA conta."""
+        agora = time.time()
+        cache = Brain._ROTACAO_RUGIDO_CACHE
+        if agora - cache["ts"] < 5.0:
+            return cache["valor"]
+        valor = True
+        try:
+            with open(config._SETTINGS_PATH, encoding="utf-8") as f:
+                dados = json.load(f)
+            valor = bool(dados.get("TANK_ROTACAO_RUGIDO_ATIVA", True))
+        except Exception:
+            pass
+        cache["valor"] = valor
+        cache["ts"] = agora
+        return valor
+
+    _FASE_BOSS_RE = re.compile(r"fase\s*(\d+)", re.IGNORECASE)
+
+    def _fase_boss_atual(self):
+        """Extrai o número da fase do boss da tela ('... BOSS — Fase 2 —
+        Fúria Congelada' -> 2), ou None se a tela não mostrar fase nenhuma
+        (mob comum, sem boss ativo)."""
+        m = self._FASE_BOSS_RE.search(self.s.text or "")
+        return int(m.group(1)) if m else None
+
+    def _tanks_rotacao(self):
+        """Lista ORDENADA dos tanks do grupo, se houver 2+ (senão, lista
+        vazia — rotação desligada, comportamento de sempre). Os papéis vêm
+        do shared['roles'] do combate atual (s._combat_hb).
+        Desligável NA HORA via toggle em Configurações no Telegram (pedido
+        do usuário 2026-07-22: "essa atualização do rugido... deixou o
+        conteúdo mais lento" — cada Rugido forçado consome o turno do tank
+        em vez de atacar). Lê o settings.json ao vivo (ver
+        _rotacao_rugido_ativa) em vez do config só-lido-no-boot, então
+        funciona mesmo com o bot já rodando/no meio de uma masmorra.
+        Também só ATIVA a partir da Fase 2 do boss (pedido do usuário
+        2026-07-22: "ele só começa a dar aom a partir da fase 2... até lá,
+        ficar fazendo o check é meio que desnecessário e só come tempo" —
+        depois esclarecido: "antes é desligado, tudo desligado... até os
+        mobs normais"). Ou seja: SÓ ativa quando a tela mostra 'Fase N' com
+        N>=2 explicitamente; qualquer coisa antes disso — mobs comuns sem
+        fase nenhuma, ou Fase 1 do boss — fica com o comportamento simples
+        de sempre (Rugido só pela janela de HP, sem revezamento forçado)."""
+        if not self._rotacao_rugido_ativa():
+            return []
+        fase = self._fase_boss_atual()
+        if fase is None or fase < 2:
+            return []
+        sh = getattr(self.s, "_combat_hb", None)
+        if not isinstance(sh, dict):
+            return []
+        roles = sh.get("roles") or {}
+        tanks = sorted(n for n, papel in roles.items() if papel == "tank")
+        return tanks if len(tanks) >= 2 and self.s.name in tanks else []
+
+    def _rotacao_rugido_minha_vez(self, tanks) -> bool:
+        """True se É a vez DESTE tank lançar o Rugido na rotação. O Rugido
+        protege a rodada do lançamento + a SEGUINTE (2 rodadas — corrigido
+        pelo usuário 2026-07-21, antes eu assumia 3): o PRÓXIMO da rotação
+        lança quando a cobertura do anterior termina (2 rodadas decorridas).
+        ATENÇÃO: com duração 2 e recarga 4, o ciclo de 2 tanks fica JUSTO
+        (cada um lança a cada 4 rodadas = exatamente a recarga) — um atraso
+        de 1 rodada na observação pode abrir 1 rodada de buraco ocasional;
+        com 3 tanks sobraria folga. As rodadas avançam em sincronia entre
+        as contas (jogo por rodada), então contar 'decorridos' pelo MEU
+        contador local, ancorado no momento em que observei o lançamento,
+        fica preciso o bastante (erro máximo de ±1 rodada)."""
+        RUGIDO_DURACAO = 2   # rodadas de proteção, contando a do lançamento
+        sh = getattr(self.s, "_combat_hb", None) or {}
+        seq = sh.get("rugido_seq", 0)
+        if seq != self._rugido_seq_visto:
+            self._rugido_seq_visto = seq
+            self._rugido_round_visto = self.round_num
+        if seq == 0:
+            return tanks[0] == self.s.name   # ninguém lançou ainda: o 1º abre
+        decorridos = (self.round_num - self._rugido_round_visto
+                      if self._rugido_round_visto is not None else 99)
+        ultimo = sh.get("rugido_por")
+        try:
+            proximo = tanks[(tanks.index(ultimo) + 1) % len(tanks)]
+        except ValueError:
+            proximo = tanks[0]
+        if self.s.name == proximo:
+            # dispara 1 rodada ANTES do fim teórico da cobertura: o outro
+            # tank só OBSERVA o lançamento na rodada seguinte (atraso de
+            # anotação de ~1), então este -1 compensa e cai na emenda
+            # exata. No pior caso (sem atraso), gera 1 rodada de
+            # sobreposição — inofensiva: se a recarga ainda não zerou, a
+            # tentativa falha na tela e repete na rodada seguinte sozinha.
+            return decorridos >= RUGIDO_DURACAO - 1
+        # fallback: se o "próximo" não lançou (travou/morreu/em recarga) e o
+        # aggro segue caído, qualquer tank com Rugido pronto cobre
+        return decorridos >= RUGIDO_DURACAO + 1 and self.believe_ready("Rugido do Rochedo")
 
     def believe_ready(self, name):
         """Acreditamos que a alma está fora de recarga? (rastreio na memória)"""
@@ -3060,9 +4348,17 @@ class Brain:
                        and self.round_num == self.rugido_usado_na_rodada + 1)
         hp_min = getattr(config, "TANK_RUGIDO_HP_MIN", 0) / 100.0
         hp_max = getattr(config, "TANK_RUGIDO_HP_MAX", 100) / 100.0
+        # Com a ROTAÇÃO de tanks ativa (2+ tanks), o Rugido sai DAQUI — só a
+        # rotação decide quando cada tank lança (ver _act_tank), senão a
+        # prioridade normal queimaria a recarga fora de hora e abriria
+        # buraco no revezamento. O Escudo de Ossos (combo pós-Rugido) segue
+        # normal — ancorado no rugido_usado_na_rodada do PRÓPRIO tank.
+        rotacao_ativa = bool(self._tanks_rotacao())
         out = []
         for n, cd in priority:
             if n == "Rugido do Rochedo":
+                if rotacao_ativa:
+                    continue
                 if ratio is None or not (hp_min <= ratio <= hp_max):
                     continue
             elif n == "Escudo de Ossos":
@@ -3076,6 +4372,13 @@ class Brain:
         self.soul_ready_at[name] = self.round_num + cd
         if name == "Rugido do Rochedo":
             self.rugido_usado_na_rodada = self.round_num
+            # publica pro grupo (rotação de tanks): quem lançou e uma
+            # "geração" incremental — os outros tanks ancoram a contagem
+            # de rodadas de efeito nisso (ver _rotacao_rugido_minha_vez)
+            sh = getattr(self.s, "_combat_hb", None)
+            if isinstance(sh, dict):
+                sh["rugido_seq"] = sh.get("rugido_seq", 0) + 1
+                sh["rugido_por"] = self.s.name
 
     def mark_seen_on_cd(self, name):
         """A tela mostrou a alma em recarga apesar do palpite -> tenta depois."""
@@ -3116,9 +4419,26 @@ class Brain:
         # tentativas numa única rodada quando o Telegram tá lento). Cada
         # retry reescrevia o arquivo inteiro de novo, travando o loop
         # assíncrono e atrasando as OUTRAS contas rodando em paralelo. Agora
-        # só grava 1x por RODADA REAL — os retries continuam agindo
-        # normalmente, só não gravam status de novo à toa.
-        if cur is not None and rodada_nova:
+        # grava 1x por RODADA REAL — os retries continuam agindo normalmente,
+        # só não gravam status de novo à toa.
+        # REFORÇO POR TEMPO (pedido do usuário 2026-07-19: "bem lento a
+        # atualização, tem como acelerar?" — print do /status via Telegram
+        # mostrando 'dado de 36s atrás' pra uma conta que ainda não tinha
+        # fechado a rodada de combate): sem isso, uma conta poderia ficar
+        # com o status.json travado no valor de rodadas atrás inteiras se a
+        # rodada demorasse muito pra fechar (API do Telegram lenta, monstro
+        # com HP alto, etc) — o "1x por rodada" sozinho não tem limite de
+        # tempo. Agora, além de gravar a cada rodada nova, também grava se já
+        # fez STATUS_WRITE_MIN_INTERVALO segundos desde a ÚLTIMA gravação
+        # (mesmo sem rodada nova) — intervalo curto o bastante pra não ficar
+        # velho, mas ainda bem espaçado pra não voltar ao problema antigo de
+        # travar o loop escrevendo toda hora.
+        agora_ws = time.time()
+        deve_escrever = rodada_nova or (
+            agora_ws - getattr(self, "_ultimo_write_status_ts", 0.0)
+            >= getattr(config, "STATUS_WRITE_MIN_INTERVALO", 5.0))
+        if cur is not None and deve_escrever:
+            self._ultimo_write_status_ts = agora_ws
             hp_mob = monster_hp(self.s.text)
             write_status(self.s.name, cur, hp_max, progresso_atual_texto(self.s.text),
                          hp_monstro=(hp_mob[0] if hp_mob else None),
@@ -3126,7 +4446,17 @@ class Brain:
                          inicio_ts=getattr(self.s, "_t_inicio_conteudo", None),
                          nivel=getattr(self.s, "_nivel", None),
                          xp_faltam=getattr(self.s, "_xp_faltam", None),
-                         eta_proximo_nivel_seg=getattr(self.s, "_eta_proximo_nivel_seg", None))
+                         xp_atual=getattr(self.s, "_xp_atual", None),
+                         eta_proximo_nivel_seg=getattr(self.s, "_eta_proximo_nivel_seg", None),
+                         atk=getattr(self.s, "_atk", None), defesa=getattr(self.s, "_def", None),
+                         crit=getattr(self.s, "_crit", None),
+                         energia=getattr(self.s, "_energia_atual", None),
+                         energia_max=getattr(self.s, "_energia_max", None),
+                         buff_texto=getattr(self.s, "_buff_texto", None),
+                         monstro_nome=monster_name(self.s.text),
+                         dupla=getattr(self.s, "_dupla_num", None),
+                         estoque_pocao_vida=getattr(self.s, "pocoes_estimadas", None),
+                         xp_pct_nivel=getattr(self.s, "_xp_pct_nivel", None))
 
         # Reforço de início: quem entrou com HP baixo bebe 1 poção ANTES de
         # partir pra luta (feito uma vez, na 1ª ação). SÓ pros NÃO-TANKS: o
@@ -3258,12 +4588,66 @@ class Brain:
         # precisasse curar por segurança, em vez de assumir que está bem.
         precisa_curar = (ratio is not None and ratio <= self._limite_hp_conta()) or (
             ratio is None and took)
-        dano_tank = damage_to_me(self.s.text, self.s.char)
+        # Dano sofrido: combina os DOIS sinais e usa o MAIOR (pedido do
+        # usuário 2026-07-23: print do Lago de Kryos mostrando "Pri recebeu
+        # 61 de dano" no evento, mas o log seguia de 'dano sofrido: 0' —
+        # porque a diferença de HP sozinha (usada numa correção anterior,
+        # pro mesmo pedido) pode dar 0 se dano E cura acontecerem na MESMA
+        # janela entre duas leituras, mascarando um pelo outro. Agora usa o
+        # MAIOR entre a diferença real de HP e o que aparece no texto do
+        # evento ("causa X em Y" / "recebeu X de dano") — cobre os dois
+        # jeitos de perder essa informação: evento que já sumiu da tela
+        # (diferença de HP resolve) OU cura mascarando a diferença (parse
+        # do evento resolve).
+        hp_anterior = getattr(self.s, "_hp_anterior_tank", None)
+        dano_por_diferenca = max(0, hp_anterior - cur) if (hp_anterior is not None and cur is not None) else 0
+        dano_por_evento = damage_to_me(self.s.text, self.s.char)
+        dano_tank = max(dano_por_diferenca, dano_por_evento)
+        if cur is not None:
+            self.s._hp_anterior_tank = cur
         log(self.s.name, f"🩺 HP={cur} "
                          f"ratio={('%.0f%%' % (ratio * 100)) if ratio is not None else 'NÃO LIDO'} "
-                         f"limite={self._limite_hp_conta() * 100:.0f}%"
-                         f"{f' · levou {dano_tank} de dano' if dano_tank > 0 else ''} -> "
+                         f"limite={self._limite_hp_conta() * 100:.0f}% "
+                         f"· dano sofrido: {dano_tank} -> "
                          f"{'BEBER poção' if precisa_curar else 'ok, não bebe'} (tank)")
+        if ratio is None:
+            # DIAGNÓSTICO (pedido do usuário 2026-07-20: "tá mt errado a
+            # leitura dos hp" — 'NÃO LIDO' aparecendo intercalado com
+            # leituras válidas, sem estar preso em nenhum submenu visível
+            # nos logs). Ainda não dá pra saber a causa exata sem ver a
+            # tela crua nesse instante — este log só aparece QUANDO falha,
+            # então manda ele de volta na próxima vez que acontecer e dá
+            # pra identificar o formato exato que está confundindo o
+            # player_hp() (suspeita: alguma variação de layout por mapa).
+            if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                log(self.s.name, f"🔍 DEBUG HP não lido (tank) — texto cru:\n{self.s.text}")
+        # CHECK CRUZADO DE AGGRO (corrigido 2026-07-21, 2ª morte real: log
+        # completo mostrou que às 17:38:27-29 os DOIS tanks lançaram Rugido
+        # quase na mesma rodada — um lançamento REDUNDANTE. Causa raiz: o
+        # rastreio de 'quando foi o último Rugido' só era atualizado dentro
+        # de _rotacao_rugido_minha_vez, que só rodava no ramo "HP OK" — um
+        # tank que passasse várias rodadas seguidas CURANDO (ramo
+        # precisa_curar) ficava com o rastreio DESATUALIZADO, achava que o
+        # aggro tinha caído fazia tempo, e lançava por cima do lançamento
+        # recente do outro tank. Isso sincronizou as recargas dos dois, e
+        # quando veio a pancada pesada seguinte (AoM), NENHUM tinha Rugido
+        # disponível — daí a morte. Correção: chama _rotacao_rugido_minha_vez
+        # (que atualiza o rastreio como efeito colateral) INCONDICIONALMENTE,
+        # nesta linha, ANTES de decidir curar ou não — mantém o rastreio
+        # sempre fresco e generaliza o furo de cura pra QUALQUER tank da vez
+        # (antes só o 1º da lista podia preferir Rugido à cura).
+        _tanks_cx = self._tanks_rotacao()
+        _minha_vez_cx = self._rotacao_rugido_minha_vez(_tanks_cx) if _tanks_cx else False
+        if (precisa_curar and _tanks_cx and _minha_vez_cx
+                and self.believe_ready("Rugido do Rochedo")
+                and ratio is not None
+                and ratio >= getattr(config, "TANK_RUGIDO_PISO_AGGRO", 30) / 100.0):
+            _rugido_lista = [(n, cd) for n, cd in self.s.souls if "rugido" in norm(n)]
+            if _rugido_lista:
+                log(self.s.name, "⚡ minha vez na rotação + preciso curar — "
+                                 "Rugido antes (mantém o aggro contínuo).")
+                if await use_soul_from_priority(self.s, self, _rugido_lista, forcar=True):
+                    return
         if precisa_curar:
             if ratio is None:
                 log(self.s.name, "⚠️ não consegui ler o HP do tank, mas o log mostra dano "
@@ -3296,6 +4680,54 @@ class Brain:
             return
         if await self._checar_curar_antes("Rugido/Alma"):
             return
+        # ROTAÇÃO DE TANKS (2+): reveza o Rugido pra o aggro nunca cair —
+        # cobre inclusive o AoE SEM aviso do Boss 2 (pedido do usuário
+        # 2026-07-21). Ignora a janela de HP configurada (o objetivo é
+        # aggro contínuo); a cura por poção continua com prioridade
+        # absoluta acima. Reaproveita _tanks_cx/_minha_vez_cx já calculados
+        # no topo desta função (mesma rodada, estado não muda entre lá e
+        # aqui) — evita recomputar a observação da rotação 2x por rodada.
+        if _tanks_cx and _minha_vez_cx:
+            _rugido_lista = [(n, cd) for n, cd in self.s.souls if "rugido" in norm(n)]
+            if _rugido_lista:
+                log(self.s.name, "🔁 rotação de tanks — minha vez do Rugido do Rochedo.")
+                if await use_soul_from_priority(self.s, self, _rugido_lista, forcar=True):
+                    return
+                log(self.s.name, "(meu Rugido em recarga — o outro tank cobre; defendo)")
+        # ESPECIAL DAS MINAS (pedido do usuário 2026-07-21): "ZERO ABSOLUTO
+        # em carga! (1 turno(s))" é o aviso de que o boss vai usar o especial
+        # NA PRÓXIMA rodada — o ideal é o tank usar Rugido do Rochedo agora
+        # pra segurar o aggro e absorver o golpe. Força o Rugido ANTES da
+        # prioridade normal (ignorando a janela de HP configurada, porque nesse
+        # momento o que importa é o aggro, não o HP em si). Se o Rugido estiver
+        # em recarga, cai pra lógica normal abaixo. Com a ROTAÇÃO ativa (2+
+        # tanks) este bloco fica DESLIGADO — o aggro já é contínuo e forçar
+        # aqui faria os 2 tanks lançarem na mesma rodada, queimando recarga.
+        # CORRIGIDO 2026-07-22 (usuário: "o piso continua funcionando, aí
+        # ele fica usando rugido, mesmo sem necessidade, antes da fase 2"):
+        # como a rotação agora só ativa a partir da Fase 2 (_tanks_cx fica
+        # []) ANTES da fase 2 também, a condição 'not _tanks_cx' passou a
+        # ser verdadeira sempre nesse período — reativando este força-Rugido
+        # justamente onde ele não devia rodar. Adiciona o MESMO gate de fase
+        # (só dispara com Fase >= 2 confirmada na tela).
+        # ESTA É A VERSÃO PRA DISTRIBUIR PROS AMIGOS (pedido do usuário
+        # 2026-07-25: "adicionei uns conteúdos que ainda não quero
+        # disponibilizar... a mecânica do rugido, para a masmorra da
+        # montanha") — MINAS_ESPECIAL_RUGIDO_ATIVO default False aqui (só
+        # nesta cópia; a pasta principal continua com o especial ativo,
+        # ainda em teste). Com False, esta conta nunca força o Rugido pelo
+        # aviso de Zero Absoluto — cai direto na prioridade normal do tank.
+        _txt_tela = norm(self.s.text or "")
+        _fase_zero_abs = self._fase_boss_atual()
+        if (getattr(config, "MINAS_ESPECIAL_RUGIDO_ATIVO", True)
+                and _fase_zero_abs is not None and _fase_zero_abs >= 2 and not _tanks_cx
+                and "zero absoluto em carga" in _txt_tela and "(1 turno" in _txt_tela):
+            _rugido_lista = [(n, cd) for n, cd in self.s.souls if "rugido" in norm(n)]
+            if _rugido_lista:
+                log(self.s.name, "⚡ ZERO ABSOLUTO (1 turno) — forçando Rugido do Rochedo.")
+                if await use_soul_from_priority(self.s, self, _rugido_lista, forcar=True):
+                    return
+                log(self.s.name, "(Rugido em recarga — defende normalmente)")
         if await use_soul_from_priority(self.s, self, self.prioridade_tank(self.s.souls, ratio),
                                          forcar=self.deve_forcar_resync_alma()):
             return
@@ -3312,19 +4744,58 @@ class Brain:
         #    MASMORRA: mantém o comportamento antigo (tomar dano = aggro vazou
         #    do tank -> cura; ou HP abaixo do limite "Outros").
         caca = getattr(self.s, "modo_caca", False)
-        dano_rodada = damage_to_me(self.s.text, self.s.char)
-        dano_rodada_txt = f" · levou {dano_rodada} de dano" if dano_rodada > 0 else ""
+        # Dano sofrido: MAIOR entre diferença de HP e parse de evento (ver
+        # comentário completo no _act_tank acima — mesmo pedido do usuário
+        # 2026-07-23, print do Lago de Kryos mostrando "recebeu 61 de dano"
+        # no evento mas o log mostrando 0 — cura e dano na mesma janela
+        # mascaravam a diferença de HP sozinha).
+        hp_anterior_other = getattr(self.s, "_hp_anterior_other", None)
+        dano_por_diferenca = max(0, hp_anterior_other - cur) if (hp_anterior_other is not None and cur is not None) else 0
+        dano_por_evento = damage_to_me(self.s.text, self.s.char)
+        dano_rodada = max(dano_por_diferenca, dano_por_evento)
+        if cur is not None:
+            self.s._hp_anterior_other = cur
+        dano_rodada_txt = f" · dano sofrido: {dano_rodada}"
         if caca:
             limite = getattr(self.s, "caca_vida_ratio", 0.0) or 0.0
-            precisa_pocao = (limite > 0 and ratio is not None and ratio <= limite)
+            # REDE DE SEGURANÇA (bug real reportado pelo usuário 2026-07-19,
+            # log mostrando '[Polar] HP=None ratio=NÃO LIDO -> ok, não bebe'
+            # bem no meio de ficar presa num submenu 'Escolha uma alma'):
+            # SEM ratio (não deu pra ler o HP de jeito nenhum), a conta
+            # ficava sem NENHUMA proteção aqui — 'precisa_pocao' era sempre
+            # False nesse caso, então mesmo com o HP crítico de verdade, o
+            # bot nunca bebia enquanto a tela ficasse presa assim. A mesma
+            # rede de segurança que o tank já tinha (_act_tank, linha acima)
+            # agora vale aqui também: SEM conseguir ler o HP, usa 'took'
+            # (log de dano nesta rodada) como sinal de que precisa curar por
+            # segurança, em vez de simplesmente assumir "tá tudo bem".
+            precisa_pocao = (limite > 0 and ratio is not None and ratio <= limite) or (
+                ratio is None and took)
             # Log do HP e da decisão de poção na caçada (mantido — dá visibilidade
             # do que o bot vê; NÃO afeta o comportamento, é só um log).
             log(self.s.name, f"🩺 HP={cur} "
                              f"ratio={('%.0f%%' % (ratio * 100)) if ratio is not None else 'NÃO LIDO'} "
                              f"limite={limite * 100:.0f}%{dano_rodada_txt} -> "
                              f"{'BEBER poção' if precisa_pocao else 'ok, não bebe'}")
+            if ratio is None:
+                # DIAGNÓSTICO — mesmo motivo do _act_tank acima (pedido do
+                # usuário 2026-07-20: "tá mt errado a leitura dos hp").
+                if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                    log(self.s.name, f"🔍 DEBUG HP não lido — texto cru:\n{self.s.text}")
         else:
             precisa_pocao = took or (ratio is not None and ratio <= self._limite_hp_conta())
+            # Log do HP e da decisão de poção na MASMORRA/CAÇADA EM DUPLA/
+            # CRIPTA — faltava aqui (só existia no ramo 'caca' acima e no
+            # tank), então quem não é tank checava o HP em SILÊNCIO: a
+            # checagem sempre funcionou (bebia poção normalmente quando
+            # precisava), só não dava pra ver isso acontecer no log — pedido
+            # do usuário 2026-07-25 ("notei que o Morcequinho não tava
+            # verificando o HP", olhando o log da Atividade sem ver nenhuma
+            # linha 🩺 pra ele, só pros tanks).
+            log(self.s.name, f"🩺 HP={cur} "
+                             f"ratio={('%.0f%%' % (ratio * 100)) if ratio is not None else 'NÃO LIDO'} "
+                             f"limite={self._limite_hp_conta() * 100:.0f}%{dano_rodada_txt} -> "
+                             f"{'BEBER poção' if precisa_pocao else 'ok, não bebe'}")
         if precisa_pocao:
             if await act_potion(self.s):
                 return
@@ -3400,6 +4871,17 @@ async def combat_loop(s: Session, leave_event: asyncio.Event, restart_event: asy
     Templo do Oásis (Duo) usa 'vitoria' (tela "Templo do Oásis — Vitória!") —
     mesmo layout de combate, só muda o texto da tela de conclusão."""
     brain = Brain(s)
+    # CORRIGIDO 2026-07-21 (usuário: nas Minas, "após matar o adversário
+    # apareceu a mensagem que o mob morreu" e o bot pausou tudo — log real
+    # mostrando '💀 morte detectada no grupo' logo após uma rodada normal).
+    # A Masmorra chamava someone_died SEM a lista de nomes — qualquer
+    # "morreu"/"foi derrotado" na tela contava como morte de JOGADOR. Nas
+    # masmorras antigas isso nunca aparecia, mas as Minas imprimem a morte
+    # do MOB na transição automática de andar. Passando os nomes do grupo
+    # (mesma proteção que a Cripta/Fortaleza já usam), palavra de morte só
+    # conta na linha de um personagem NOSSO; morte real continua coberta
+    # também pelo HP 0 na linha do jogador e pelo '❌ Eliminado' avulso.
+    nomes_grupo = [x.char for x in (shared.get("sessions") or []) if getattr(x, "char", None)]
     # RETOMADA (pedido do usuário 2026-07-16): se quem chamou marcou esta
     # sessão como uma retomada de conteúdo já ativo (ver run_account/
     # run_templo_oasis_dupla), força conferir o cooldown REAL das almas já
@@ -3452,8 +4934,32 @@ async def combat_loop(s: Session, leave_event: asyncio.Event, restart_event: asy
 
     while True:
         if restart_event.is_set():   # outra conta pediu reinício
+            # BUG REAL corrigido 2026-07-21 (relato do amigo do usuário,
+            # "Léozão": "quando alguém perde a vez, ele dá um /start" e "fica
+            # sem ação e para o bot" — log real mostrando TODAS as contas do
+            # grupo falhando 'não consegui ler o Perfil' logo em seguida,
+            # ainda com os botões de combate ['⚔️ Atacar', '🛡 Defender', ...]
+            # visíveis — ou seja, ainda DENTRO da sala). A causa: esse ramo
+            # fazia a conta parar de processar SEM sair da sala — diferente
+            # do ramo de leave_event (linha abaixo), que já chamava
+            # leave_room() certinho. As contas que não foram a que pediu o
+            # reinício ficavam fisicamente presas no combate, enquanto o
+            # código de cima (run_account) já assumia que elas estavam
+            # livres no Menu pra ler Perfil/vender — e isso falhava, porque
+            # elas ainda estavam em combate. Agora sai da sala igual o
+            # leave_event já fazia.
             shared.setdefault("em_combate", {})[s.name] = 0
+            await leave_room(s)
             return
+
+        # "⏹️🚪 Parar e Sair" pedido (painel/Telegram) — avisa o GRUPO
+        # inteiro via o mesmo leave_event já usado pra morte/poção baixa,
+        # em vez de só esta conta sair sozinha e deixar as outras pra trás
+        # levando dano à toa.
+        if sair_e_parar_pedido() and not leave_event.is_set():
+            log(s.name, "⏹️🚪 'Parar e Sair' pedido — saindo da sala.")
+            leave_event.set()
+            shared["stop"].set()
 
         # alguém do grupo morreu (detectado por qualquer conta)? sai todo mundo.
         if leave_event.is_set():
@@ -3479,9 +4985,11 @@ async def combat_loop(s: Session, leave_event: asyncio.Event, restart_event: asy
                 houve_rodada_nova = True
         atualizar_recompensas(shared, s.texto_recompensas)   # ouro/XP/drop de cada mob, a cada refresh
 
-        if someone_died(txt):
+        if someone_died(txt, nomes_grupo):
+            _linha_morte = linha_morte_detectada(txt, nomes_grupo)
             log(s.name, "💀 morte detectada no grupo — acionando saída de todos e "
-                        "pausando o bot (não inicia outra masmorra sozinho).")
+                        "pausando o bot (não inicia outra masmorra sozinho)."
+                        + (f"\n    linha que disparou: {_linha_morte!r}" if _linha_morte else ""))
             leave_event.set()
             shared["stop"].set()
             shared.setdefault("em_combate", {})[s.name] = 0
@@ -3498,6 +5006,22 @@ async def combat_loop(s: Session, leave_event: asyncio.Event, restart_event: asy
                 except Exception as e:
                     log(s.name, f"(não consegui registrar a morte: {e!r})")
             await leave_room(s)
+            # MINAS (2026-07-21): tela de saída antecipada ("Progresso
+            # acumulado que você vai levar: X XP / Y Gold") usa o MESMO
+            # formato da Cripta — parse_saida_cripta já lê. O XP/Gold são
+            # iguais pra todos, então montamos o acumulado com todos os
+            # jogadores do grupo. Só salva na primeira conta a chegar (DEDUP).
+            _alt_minas = getattr(config, "MASMORRAS_ALTERNATIVAS", {}).get(config.TIPO_MASMORRA) or {}
+            if (_alt_minas.get("resultado_final")
+                    and not shared.get("conclusao", {}).get("_morte_capturada")):
+                _xp_saida, _gold_saida = parse_saida_cripta(s.text)
+                if _xp_saida or _gold_saida:
+                    _nomes_g = [x.char for x in (shared.get("sessions") or []) if getattr(x, "char", None)]
+                    _jogs = {n: {"gold": _gold_saida, "drops": []} for n in _nomes_g} if _nomes_g \
+                        else {s.char: {"gold": _gold_saida, "drops": []}}
+                    shared.setdefault("conclusao_minas_morte", {
+                        "xp_total": _xp_saida, "jogadores": _jogs})
+                shared.setdefault("conclusao", {})["_morte_capturada"] = True
             return
 
         # SEGURANÇA: alguma OUTRA conta travou no meio da luta (FloodWait, rede,
@@ -3534,6 +5058,7 @@ async def combat_loop(s: Session, leave_event: asyncio.Event, restart_event: asy
             log(s.name, "🔁 perdi a vez — solicitando REINÍCIO automático do bot.")
             shared.setdefault("em_combate", {})[s.name] = 0
             restart_event.set()
+            await leave_room(s)
             return
 
         # NÃO é a tela de combate? Decide o que é ANTES de sair — sair por
@@ -3717,8 +5242,10 @@ async def combat_loop(s: Session, leave_event: asyncio.Event, restart_event: asy
                         continue
                     await poll_sleep()
                 if not _mudou:
-                    log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting'. "
-                                f"tela inteira: {ascii(s.text)}")
+                    if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                        log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting'. "
+                                    f"tela inteira: {ascii(s.text)}")
+                    _registrar_evento("conta_travada", conta=s.name, contexto="Masmorra")
                 _t_confirm = time.time() - _t1
                 log(s.name, f"⏱️ esperei a vez | agi em {_t_acao:.1f}s | "
                             f"rodada resolveu em {_t_confirm:.1f}s")
@@ -3760,11 +5287,32 @@ async def _tentar_evitar_start(s: Session) -> bool:
         log(s.name, "🚪 preso num lobby anterior — saindo antes de tentar de novo.")
         await s.click(b, label=b.text)
         return True
-    b = find_button(s.message, "voltar", "atras", "atrás", "⬅️", "⬅", "◀️", "◀", "🔙")
-    if b:
-        log(s.name, "◀️ tela travada — clicando Voltar antes do /start.")
-        await s.click(b, label=b.text)
-        return True
+    # BUG REAL 2026-07-18 (log real do usuário: depois de vender no Mercado,
+    # o bot clicou em '◀ Lojas' achando que era o 'voltar' genérico de tela
+    # travada — esse botão bate na busca por causa do glifo '◀', só que ele
+    # NÃO sai da tela, ele volta pra DENTRO da listagem do Mercado. Resultado:
+    # o bot ficava preso ali e acabava mandando /start em cima dessa tela do
+    # Mercado (a mesma exclusão de 'loja' já existe em _botao_pagina, poucas
+    # linhas abaixo, pelo mesmo motivo — só faltava aqui também). Por isso a
+    # busca genérica de 'voltar' abaixo ignora qualquer botão com 'loja' no
+    # texto.
+    # BUG REAL corrigido 2026-07-20 (log real do usuário: 'Dona Irene' presa
+    # em loop de "tela travada — clicando Voltar" numa tela de Troca de
+    # almas/skins — botões: ['🟠 Morgana', ..., '🔁 Voltar à troca']) — MESMA
+    # causa raiz do bug do '◀ Lojas': '🔁 Voltar à troca' também bate na
+    # busca genérica de 'voltar' (contém a palavra), mas só volta pra DENTRO
+    # da tela de Troca, não sai dela de verdade. Mesma exclusão, agora
+    # também pra 'troca'.
+    glifos_voltar = ("voltar", "atras", "atrás", "⬅️", "⬅", "◀️", "◀", "🔙")
+    wanted = [norm(g) for g in glifos_voltar]
+    for cand in iter_buttons(s.message):
+        tn = norm(cand.text or "")
+        if "loja" in tn or "troca" in tn:
+            continue
+        if any(w in tn for w in wanted):
+            log(s.name, "◀️ tela travada — clicando Voltar antes do /start.")
+            await s.click(cand, label=cand.text)
+            return True
     return False
 
 
@@ -3781,6 +5329,37 @@ async def back_to_menu(s: Session):
         await s.refresh()
     if _no_menu_principal(s.message):
         return
+    # NOVO (pedido do usuário 2026-07-22: "sempre depois de vender itens,
+    # na loja bot mete um [/start]") — a exclusão de botões com "loja" no
+    # _tentar_evitar_start existe por bom motivo (evita um loop conhecido,
+    # ver bug 2026-07-18 lá na função), mas isso deixava sem cobertura o
+    # caminho de saída LEGÍTIMO: se ainda estiver numa lista de
+    # Comprar/Vender (com paginação, sem "Menu" visível — só "◀ Pág N",
+    # "Pág N ▶" e "◀ Lojas"), clicar "Lojas" AQUI sobe 1 nível de VERDADE
+    # pro menu raiz da loja (onde "Menu" existe) — diferente do bug antigo,
+    # que era clicar "Lojas" como fallback GENÉRICO de qualquer tela travada
+    # (aí sim podia devolver pra DENTRO da mesma listagem).
+    # CUIDADO: o MENU PRINCIPAL do jogo também tem um botão "🏪 Loja" (a
+    # entrada da loja) — um find_button("loja") genérico bateria nele
+    # também, e se _no_menu_principal desse falso negativo bem nessa hora,
+    # o bot clicaria PRA DENTRO da loja em vez de ficar no menu (o oposto
+    # do que se quer). Por isso a busca aqui exige a SETA de voltar junto
+    # ("◀ Lojas", "⬅ Loja" etc.) — nunca casa com o "🏪 Loja" de entrada.
+    b_loja = next((cand for cand in iter_buttons(s.message)
+                   if "loja" in norm(cand.text or "")
+                   and any(seta in (cand.text or "") for seta in ("◀", "⬅", "<"))), None)
+    if b_loja:
+        log(s.name, "🏪 ainda na tela da Loja — subindo 1 nível antes do /start.")
+        await s.click(b_loja, label=b_loja.text)
+        await asyncio.sleep(config.ACTION_DELAY)
+        await s.refresh()
+        b = find_button(s.message, "menu")
+        if b:
+            await s.click(b, label="Menu")
+            await asyncio.sleep(config.ACTION_DELAY)
+            await s.refresh()
+        if _no_menu_principal(s.message):
+            return
     # Item 8: tenta as 2 saídas mais baratas antes do /start (ver
     # _tentar_evitar_start) — se algo bateu, dá mais uma chance ao 'Menu'
     # antes de finalmente recorrer ao /start.
@@ -3959,6 +5538,17 @@ async def viajar_para(s: Session, mapa: str) -> bool:
     if _no_menu_principal(s.message):
         mapa_menu = parse_mapa_no_menu(s.text)
         if mapa_menu and norm(mapa_menu) == alvo:
+            # DIAGNÓSTICO (2026-07-19, relato do usuário: log disse "[Pri] já
+            # está em Planície" às 23:26:26, mas um print tirado logo depois
+            # mostrou a conta de VERDADE na Floresta Profunda — ou seja, essa
+            # confirmação bateu "positivo" quando não devia. Loga a 1ª linha
+            # CRUA da tela junto com o valor lido, pra confirmar se foi um
+            # texto realmente desatualizado (s.text velho) ou um erro de
+            # leitura — sem isso seria chutar o fix.
+            if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                log(s.name, f"🔎 DEBUG confirmação de mapa via atalho: "
+                            f"lido='{mapa_menu}' alvo='{mapa}' — 1ª linha crua: "
+                            f"{(s.text or '').splitlines()[:1]!r}")
             log(s.name, f"🗺️ já está em {mapa_menu} (confirmado pelo menu, sem abrir Viajar).")
             return True
     if not await _abrir_viajar(s):
@@ -3966,11 +5556,18 @@ async def viajar_para(s: Session, mapa: str) -> bool:
                     f"botões: {button_texts(s.message)}")
         await s.click_text("menu", label="Menu", required=False)
         return False
-    atual = parse_mapa_atual(s.text)
-    if atual and norm(atual) == alvo:
-        log(s.name, f"🗺️ já está em {atual}.")
-        await s.click_text("menu", label="Menu", required=False)
-        return True
+    # BUG REAL corrigido 2026-07-19 (relato do usuário, com 2 prints
+    # provando: o menu principal mostrava "Floresta Profunda" — certo, bate
+    # com a realidade — mas a TELA DE VIAJAR mostrava "Atual: Planície" —
+    # ERRADO, bug do PRÓPRIO JOGO, não da leitura do bot. Confiar nesse
+    # campo pra "pular a viagem" (achando que já tinha chegado) deixava a
+    # conta presa no mapa errado sem viajar de verdade — foi exatamente o
+    # que aconteceu com a "Pri", ela ficou perdida na Floresta Profunda
+    # enquanto o bot achava que ela já estava na Planície. Agora NÃO confia
+    # mais no "Atual:" pra decidir se pula a viagem — sempre busca e clica
+    # de verdade no mapa de destino nas páginas abaixo (clicar no mapa onde
+    # já se está de verdade é inofensivo; confiar num campo bugado pra
+    # pular é que causava o bug).
     # BUG REAL 2026-07-16 (usuário: "só anda na seta pra direita, a esquerda
     # simplesmente ignora"): o código só sabia clicar 'Próximo' — se a lista
     # de Viajar abre já no meio (ex.: perto do mapa atual, não
@@ -4075,7 +5672,12 @@ async def garantir_skin_equipada(s: Session, skin: str) -> bool:
 async def read_keys_at_menu(s: Session) -> int:
     """Volta pro menu e lê quantas Chaves de Masmorra a conta tem."""
     await back_to_menu(s)
-    return keys_count(s.text)
+    qtd = keys_count(s.text)
+    # Aproveita a mesma visita ao menu principal (única tela onde essas 2
+    # infos aparecem) pra alimentar os alertas '🔑 Chaves acabando'/'👑 VIP
+    # vencendo' do Telegram — ver write_status_extra.
+    write_status_extra(s.name, chaves_masmorra=qtd, vip_ate=vip_ate(s.text))
+    return qtd
 
 
 async def heal_at_menu_if_low(s: Session, ratio=None):
@@ -4178,13 +5780,45 @@ POCAO_QTD_RE = re.compile(r"vida\s*x\s*(\d+)", re.IGNORECASE)
 PERFIL_XP_RE = re.compile(r"lv\s*(\d+).*?xp\s*:?\s*([\d.,]+).*?faltam\s*:?\s*([\d.,]+)",
                           re.IGNORECASE | re.DOTALL)
 
+# Stats de combate na tela de Perfil ("⚔️ ATK 32   🛡️ DEF 101   🎯 CRIT 9%")
+# — pedido do usuário 2026-07-19, pra mostrar no painel junto com HP/XP.
+# Exige ATK/DEF/CRIT NESSA ORDEM na mesma linha (formato visto no print) —
+# não confunde com a linha de BUFF abaixo, que tem o número ANTES da sigla
+# ("+5 DEF"), não depois ("DEF 101").
+STATS_RE = re.compile(r"atk\s+(\d+).*?def\s+(\d+).*?crit\s+(\d+)\s*%", re.IGNORECASE | re.DOTALL)
+
+# Buff temporário de combate ("+0 ATK / +5 DEF / +0% CRIT (23min)" no Perfil,
+# ou só "+5 DEF (8min)" no menu principal — o usuário confirmou que aparece
+# nos dois lugares). Group 1 = descrição do(s) bônus, group 2 = minutos
+# restantes. Só bate com ATK/DEF/CRIT precedido de sinal (+/-), o que evita
+# colidir com STATS_RE (lá o número vem DEPOIS da sigla, aqui vem ANTES).
+BUFF_RE = re.compile(r"([+\-]\d+%?\s*(?:atk|def|crit)(?:\s*/\s*[+\-]\d+%?\s*(?:atk|def|crit))*)"
+                     r"\s*\((\d+)\s*min\)", re.IGNORECASE)
+
+
+def parse_stats(text: str):
+    """(atk, def, crit%) lidos da tela de Perfil, ou None se não achar."""
+    m = STATS_RE.search(text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def parse_buff(text: str):
+    """(descrição, minutos_restantes) do buff temporário ativo (Perfil ou
+    menu principal), ou None se não tiver nenhum buff ativo agora."""
+    m = BUFF_RE.search(text or "")
+    return (m.group(1).strip(), int(m.group(2))) if m else None
+
 
 async def ler_perfil(s: Session):
     """No MENU, vai em 'Perfil' e lê nível atual + XP faltando pro PRÓXIMO
     nível (formato 'Lv 47  XP: 70669500  (Faltam: 16421863)', confirmado por
     print do usuário 2026-07-15). Usado pra estimativa de tempo até subir de
-    nível (ver estimar_tempo_ate_proximo_nivel). Retorna (nivel, xp_atual,
-    xp_faltam) ou (None, None, None) se não conseguir confirmar a tempo."""
+    nível (ver estimar_tempo_ate_proximo_nivel). De quebra (pedido do
+    usuário 2026-07-19, mesma tela já sendo lida, sem custo extra), também
+    guarda ATK/DEF/CRIT/Energia/buff ativo em s._atk/_def/_crit/
+    _energia_atual/_energia_max/_buff_texto — usados por write_status() pra
+    mostrar no painel. Retorna (nivel, xp_atual, xp_faltam) ou
+    (None, None, None) se não conseguir confirmar a tempo."""
     await back_to_menu(s)
     for _ in range(6):
         await s.refresh()
@@ -4196,6 +5830,12 @@ async def ler_perfil(s: Session):
                 xp_faltam = int(re.sub(r"[.,]", "", m.group(3)))
             except ValueError:
                 nivel = xp_atual = xp_faltam = None
+            stats = parse_stats(s.text)
+            s._atk, s._def, s._crit = stats if stats else (None, None, None)
+            energia = energia_atual(s.text)
+            s._energia_atual, s._energia_max = energia if energia else (None, None)
+            buff = parse_buff(s.text)
+            s._buff_texto = f"{buff[0]} ({buff[1]}min)" if buff else None
             await back_to_menu(s)
             return nivel, xp_atual, xp_faltam
         perfil = find_button(s.message, "perfil")
@@ -4226,6 +5866,50 @@ def _taxa_xp_por_segundo_da_chave(chave_tempo: str):
     return media_xp / media_tempo
 
 
+def _xp_baseline_hoje_ja_capturado(nome_conta: str) -> bool:
+    """True se JÁ existe um baseline de XP capturado HOJE pra essa conta —
+    ver _capturar_xp_baseline_se_novo_dia."""
+    dados = _ler_relatorio()
+    baseline = (dados.get("xp_baseline") or {}).get(nome_conta)
+    return bool(baseline and baseline.get("data") == datetime.now().strftime("%Y-%m-%d"))
+
+
+def _capturar_xp_baseline_se_novo_dia(nome_conta: str, nivel: int, xp_atual: int) -> None:
+    """🌙 XP 'real' do dia (pedido do usuário 2026-07-23: "o rank de xp...
+    varia muito do resultado real... entre eles: mortes, meu amigo usa meus
+    chars às vezes... tem como, todo dia, à meia-noite... fazer uma leitura
+    e ir atualizando com base naquele valor?") — guarda o XP exato do
+    personagem (o mesmo 'XP:' do Perfil, ver ler_perfil/PERFIL_XP_RE) como
+    referência do dia, na PRIMEIRA vez que o Perfil for relido depois da
+    virada do dia (não é no segundo exato da meia-noite — só na próxima
+    leitura periódica desta conta específica, que já acontece com
+    regularidade entre um conteúdo e outro; normalmente uma janela de
+    minutos, não horas). O relatório no Telegram passa a mostrar 'XP atual
+    − XP do baseline de hoje' — essa subtração simples não liga pra ORIGEM
+    da mudança (masmorra do bot, morte que tirou XP, uso manual por outra
+    pessoa), então reflete o ganho/perda REAL do personagem no dia, não só
+    o que o bot 'fechou' em execuções completas.
+
+    LIMITAÇÃO CONHECIDA (documentada, não filtrada por completo): 'xp_atual'
+    é o progresso DENTRO do nível atual (reseta a cada level-up, ver
+    docstring de atualizar_perfil_e_estimativa) — se acontecer um level-up
+    bem no meio do dia, entre o baseline e uma leitura posterior, a simples
+    subtração pode mostrar um número estranho por ALGUMAS HORAS (não temos
+    a tabela de XP-por-nível do jogo pra corrigir isso automaticamente).
+    Na prática, personagens de nível alto costumam precisar de MILHÕES de
+    XP por nível, então um level-up cair bem dentro da janela de 1 dia é
+    raro — e o problema se autocorrige sozinho no dia seguinte, quando um
+    baseline novo (já no nível novo) é capturado."""
+    if not _xp_baseline_hoje_ja_capturado(nome_conta):
+        dados = _ler_relatorio()
+        dados.setdefault("xp_baseline", {})[nome_conta] = {
+            "data": datetime.now().strftime("%Y-%m-%d"), "nivel": nivel, "xp_atual": xp_atual,
+        }
+        _salvar_relatorio(dados)
+        log(nome_conta, f"📊 XP baseline de hoje capturado: Lv{nivel}, "
+                        + f"{xp_atual:,}".replace(",", ".") + " XP.")
+
+
 async def atualizar_perfil_e_estimativa(s: Session, chave_tempo: str = None) -> None:
     """Lê o Perfil (nível/XP/faltam) e calcula a taxa de XP dessa conta,
     guardando em s._nivel/s._xp_faltam/s._eta_proximo_nivel_seg — o
@@ -4245,6 +5929,20 @@ async def atualizar_perfil_e_estimativa(s: Session, chave_tempo: str = None) -> 
     com caçada, com exceções, então não dá pra ter uma chave confiável)."""
     nivel, xp_atual, xp_faltam = await ler_perfil(s)
     agora = time.time()
+    # 🎉 Notificação de level-up (pedido do usuário 2026-07-22) — compara
+    # com o nível da leitura ANTERIOR desta mesma conta (guardado na sessão,
+    # já que o Perfil só é revisitado periodicamente, não toda rodada).
+    # Só dispara a partir da 2ª leitura em diante (a 1ª é só a "linha de
+    # base" — sem isso, todo bot que acabasse de logar disparava um "subiu
+    # de nível" falso comparando com None).
+    nivel_anterior = getattr(s, "_nivel_anterior_lido", None)
+    if nivel is not None and nivel_anterior is not None and nivel > nivel_anterior:
+        try:
+            _registrar_evento("subiu_nivel", conta=s.name, nivel=nivel, nivel_anterior=nivel_anterior)
+        except Exception:
+            pass
+    if nivel is not None:
+        s._nivel_anterior_lido = nivel
     if nivel is not None and xp_atual is not None:
         xp_anterior = getattr(s, "_xp_perfil_anterior", None)
         ts_anterior = getattr(s, "_xp_perfil_anterior_ts", None)
@@ -4260,6 +5958,25 @@ async def atualizar_perfil_e_estimativa(s: Session, chave_tempo: str = None) -> 
         s._xp_perfil_anterior_ts = agora
     s._nivel = nivel
     s._xp_faltam = xp_faltam
+    s._xp_atual = xp_atual
+    if nivel is not None and xp_atual is not None:
+        try:
+            _capturar_xp_baseline_se_novo_dia(s.name, nivel, xp_atual)
+        except Exception:
+            pass
+    # % exata de progresso do nível atual (pedido do usuário 2026-07-20: "a
+    # barra de xp tá vazia, não reflete o quanto já preencheu, lá no perfil
+    # mostra") — antes o painel tentava ADIVINHAR isso rastreando a queda do
+    # 'xp_faltam' desde que o bot começou a observar essa conta (sempre
+    # começava do zero, mesmo que o nível já estivesse quase completo) — mas
+    # dá pra calcular a % REAL, exata, com o que já é lido AQUI MESMO: 'XP:
+    # {xp_atual}  (Faltam: {xp_faltam})' — xp_atual é o quanto já progrediu
+    # DENTRO do nível atual, xp_faltam o quanto falta NESSE MESMO nível, e
+    # 'xp_atual + xp_faltam' é o total exigido pelo nível inteiro.
+    if xp_atual is not None and xp_faltam is not None and (xp_atual + xp_faltam) > 0:
+        s._xp_pct_nivel = xp_atual / (xp_atual + xp_faltam)
+    else:
+        s._xp_pct_nivel = None
     taxa = _taxa_xp_por_segundo_da_chave(chave_tempo) if chave_tempo else None
     if taxa is None:
         taxa = getattr(s, "_xp_por_segundo", None)
@@ -4386,6 +6103,160 @@ async def ler_itens_inventario(s: Session) -> int:
     return total
 
 
+async def ler_chave_especial_inventario(s: Session, nome_item: str) -> int:
+    """Quantos 'nome_item' a conta tem, procurando em Inventário -> Ferramentas
+    (paginando com a seta se precisar) — pedido do usuário 2026-07-20
+    (Covil do Lord/'Chave do Ossuário': "ele identifica a chave de masmorra,
+    que não é essa que usa... pra ver se tem a chave tem que fazer os
+    seguintes passos: inventário, ferramentas, ver se tá nessa página,
+    clicando na seta"). DIFERENTE de read_keys_at_menu()/keys_count(): essa
+    chave NÃO aparece no menu principal, só dentro do Inventário mesmo —
+    e às vezes só na 2ª página (confirmado por print: 'Ferramentas —
+    página 2/2'). Genérico de propósito — serve pra qualquer chave especial
+    futura que precise do mesmo caminho, não só a do Ossuário. Sempre volta
+    pro menu principal antes de retornar (com ou sem sucesso)."""
+    padrao = re.compile(re.escape(norm(nome_item)) + r"\s*x\s*(\d+)", re.IGNORECASE)
+    await back_to_menu(s)
+    if not await s.click_text("inventario", "inventário", label="Inventário", required=False):
+        log(s.name, f"⚠️ não achei o botão 'Inventário' pra checar '{nome_item}'.")
+        return 0
+    await s.refresh()
+    await s.click_text("ferramentas", required=False)
+    await s.refresh()
+    qtd = 0
+    for _pagina in range(6):
+        m = padrao.search(norm(s.text))
+        if m:
+            qtd = int(m.group(1))
+            break
+        avancar = find_button(s.message, "proxima", "próxima", "➡️", "➡", "avancar", "avançar")
+        if not avancar:
+            break
+        await s.click(avancar, label="próxima página")
+        await s.refresh()
+    await back_to_menu(s)
+    return qtd
+
+
+async def _achar_mercador_aqui(s: Session):
+    """Clica em 'Loja' (existe em quase todo mapa) e procura uma opção
+    de mercador de VERDADE na tela de escolha ('Loja da Vila'/
+    'Mercador...'). Print do usuário confirmou: o Oásis Perdido também
+    tem o botão 'Loja', mas a tela só oferece 'Matadores' e 'Castelo' —
+    nenhum dos dois vende nada, só o mercador de verdade vende.
+    Retorna o botão do mercador achado, ou None (mapa sem mercador)."""
+    if not await s.click_text("loja", label="Loja", required=False):
+        return None
+    await s.refresh()
+    for _ in range(4):
+        btn = next((b for b in iter_buttons(s.message)
+                   if "mercador" in norm(b.text) or "loja da vila" in norm(b.text)), None)
+        if btn:
+            return btn
+        # essa tela não tem paginação nem demora normalmente — só uma
+        # segunda checagem rápida, caso o 1º refresh tenha vindo cedo demais
+        await poll_sleep()
+        await s.refresh()
+    return None
+
+
+async def _entrar_na_tela_de_venda(s: Session, rotulo: str = "Mercado"):
+    """Navega Menu -> Loja -> (o primeiro mercador disponível, viajando pro
+    mapa de venda se o mapa atual não tiver mercador de verdade) -> Vender.
+    Extraído de dentro de 'vender_itens_mercado' (2026-07-19) pra poder ser
+    reaproveitado também por 'ler_itens_loja' — a MESMA navegação serve
+    tanto pra marcar itens de verdade pra vender quanto só pra LER a lista
+    (sem marcar nada).
+    Retorna (ok, mapa_original, precisa_voltar):
+      ok: True se chegou na tela 'Vender' de verdade.
+      mapa_original / precisa_voltar: pra quem chamou saber se, ao final,
+        precisa viajar de volta pro mapa de onde a conta veio."""
+    mapa_venda = getattr(config, "MERCADO_MAPA_VENDA", "Floresta Sombria")
+    mapas_sem_mercador = {norm(m) for m in (getattr(config, "MERCADO_MAPAS_SEM_MERCADOR", None) or [])}
+    await back_to_menu(s)
+
+    # Checa o mapa direto na 1ª linha do MENU (rápido — sem abrir Viajar nem
+    # clicar em Loja à toa) — se já sabemos que esse mapa não tem mercador
+    # (config.MERCADO_MAPAS_SEM_MERCADOR, ex: Oásis Perdido), nem perde tempo
+    # tentando 'Loja' aqui, já vai direto pro mapa de venda.
+    mapa_menu_atual = parse_mapa_do_menu(s.text)
+    sem_mercador_conhecido = bool(mapa_menu_atual) and norm(mapa_menu_atual) in mapas_sem_mercador
+    loja_btn = None if sem_mercador_conhecido else await _achar_mercador_aqui(s)
+    mapa_original = None
+    precisa_voltar = False
+    if not loja_btn:
+        if sem_mercador_conhecido:
+            mapa_original = mapa_menu_atual
+        else:
+            # BUG REAL corrigido 2026-07-19 (mesma causa raiz do bug de
+            # viagem achado pelo usuário — ver viajar_para: a tela de Viajar
+            # mostra 'Atual: X' ERRADO às vezes, bug do PRÓPRIO JOGO,
+            # confirmado com 2 prints — o menu principal bate com a
+            # realidade, a tela de Viajar não). Antes abria a tela de Viajar
+            # só pra ler esse campo bugado ('mapa_original' errado fazia a
+            # conta voltar pro mapa ERRADO depois de vender); agora lê
+            # direto do cabeçalho do MENU (confiável), sem precisar abrir
+            # Viajar aqui.
+            await s.click_text("menu", label="Menu", required=False)   # sai da tela de Lojas sem escolher nada
+            await s.refresh()
+            mapa_original = parse_mapa_do_menu(s.text)
+        precisa_voltar = bool(mapa_original) and norm(mapa_original) != norm(mapa_venda)
+        log(s.name, f"🗺️ {rotulo}: '{mapa_original or 'esse mapa'}' não tem um mercador de "
+                    f"verdade — indo pra '{mapa_venda}' vender, depois volta.")
+        if not await viajar_para(s, mapa_venda):
+            log(s.name, f"⚠️ {rotulo}: não consegui viajar pra {mapa_venda} pra vender.")
+            return False, mapa_original, precisa_voltar
+        # A viagem pode deixar a conta numa tela de transição por um instante
+        # (confirmado pelo usuário via log: 'não achei o botão Loja' logo
+        # depois de chegar) — garante que voltou pro MENU de verdade antes
+        # de tentar clicar em qualquer coisa.
+        await back_to_menu(s)
+        loja_btn = await _achar_mercador_aqui(s)
+        if not loja_btn:
+            log(s.name, f"⚠️ {rotulo}: '{mapa_venda}' também não tem mercador — desisti.")
+            if precisa_voltar:
+                await viajar_para(s, mapa_original)
+            return False, mapa_original, precisa_voltar
+    await s.click(loja_btn, label=loja_btn.text)
+    await s.refresh()
+    if not await s.click_text("vender", label="Vender", required=False):
+        log(s.name, f"⚠️ {rotulo}: não achei o botão 'Vender'.")
+        return False, mapa_original, precisa_voltar
+    return True, mapa_original, precisa_voltar
+
+
+def _botao_pagina_venda(s: Session, anterior: bool):
+    """Acha o botão de virar página (Anterior/Próxima) da tela 'Vender' SEM
+    confundir com o '⬅ Lojas' (voltar/sair da loja) — esse botão também usa
+    seta pra esquerda, e na página 1 (sem 'Anterior' de verdade pra clicar)
+    a busca genérica acabava clicando nele e saindo do mercado inteiro.
+    Agora ignora qualquer botão com 'loja' no texto (mesma exclusão usada em
+    '_tentar_evitar_start', que tinha o mesmo bug)."""
+    glifos = ("◀️", "◀", "⬅️", "⬅") if anterior else ("➡️", "➡")
+    palavras = ("anterior",) if anterior else ("proxima", "próxima", "avancar", "avançar")
+    for b in iter_buttons(s.message):
+        t = b.text or ""
+        tn = norm(t)
+        if "loja" in tn:
+            continue
+        if any(g in t for g in glifos) or any(p in tn for p in palavras):
+            return b
+    return None
+
+
+async def _ir_para_primeira_pagina_venda(s: Session):
+    """Volta com 'Anterior' até não ter mais como voltar — a tela de Vender
+    pode abrir já no meio (perto de onde parou da última vez), então isso
+    garante que qualquer varredura (marcar pra vender OU só ler os itens)
+    sempre começa da 1ª página de verdade."""
+    await s.refresh()
+    for _ in range(12):
+        anterior = _botao_pagina_venda(s, anterior=True)
+        if not anterior:
+            break
+        await s.click(anterior, label="página anterior")
+
+
 async def vender_itens_mercado(s: Session) -> int:
     """MERCADO (pedido do usuário 2026-07-15): navega Menu -> Loja -> (o
     primeiro mercador disponível — vender é do INVENTÁRIO do jogador, não
@@ -4400,75 +6271,10 @@ async def vender_itens_mercado(s: Session) -> int:
     if not itens_alvo:
         return 0
     reforcos_ok = set(getattr(config, "MERCADO_REFORCOS", None) or [0, 1, 2, 3])
-    # Quase todo mapa já mostra 'Loja' direto no menu principal (confirmado
-    # pelo usuário via print — só o Oásis Perdido/Vale das Miragens não tem).
-    # Então só viaja se o botão realmente NÃO aparecer aqui — não precisa
-    # checar o mapa atual toda vez, é só tentar 'Loja' primeiro.
-    mapa_venda = getattr(config, "MERCADO_MAPA_VENDA", "Floresta Sombria")
-    mapas_sem_mercador = {norm(m) for m in (getattr(config, "MERCADO_MAPAS_SEM_MERCADOR", None) or [])}
-    await back_to_menu(s)
-
-    async def _achar_mercador_aqui():
-        """Clica em 'Loja' (existe em quase todo mapa) e procura uma opção
-        de mercador de VERDADE na tela de escolha ('Loja da Vila'/
-        'Mercador...'). Print do usuário confirmou: o Oásis Perdido também
-        tem o botão 'Loja', mas a tela só oferece 'Matadores' e 'Castelo' —
-        nenhum dos dois vende nada, só o mercador de verdade vende.
-        Retorna o botão do mercador achado, ou None (mapa sem mercador)."""
-        if not await s.click_text("loja", label="Loja", required=False):
-            return None
-        await s.refresh()
-        for _ in range(4):
-            btn = next((b for b in iter_buttons(s.message)
-                       if "mercador" in norm(b.text) or "loja da vila" in norm(b.text)), None)
-            if btn:
-                return btn
-            # essa tela não tem paginação nem demora normalmente — só uma
-            # segunda checagem rápida, caso o 1º refresh tenha vindo cedo demais
-            await poll_sleep()
-            await s.refresh()
-        return None
-
-    # Checa o mapa direto na 1ª linha do MENU (rápido — sem abrir Viajar nem
-    # clicar em Loja à toa) — se já sabemos que esse mapa não tem mercador
-    # (config.MERCADO_MAPAS_SEM_MERCADOR, ex: Oásis Perdido), nem perde tempo
-    # tentando 'Loja' aqui, já vai direto pro mapa de venda.
-    mapa_menu_atual = parse_mapa_do_menu(s.text)
-    sem_mercador_conhecido = bool(mapa_menu_atual) and norm(mapa_menu_atual) in mapas_sem_mercador
-    loja_btn = None if sem_mercador_conhecido else await _achar_mercador_aqui()
-    mapa_original = None
-    precisa_voltar = False
-    if not loja_btn:
-        if sem_mercador_conhecido:
-            mapa_original = mapa_menu_atual
-        else:
-            await s.click_text("menu", label="Menu", required=False)   # sai da tela de Lojas sem escolher nada
-            if await _abrir_viajar(s):
-                mapa_original = parse_mapa_atual(s.text)
-            await s.click_text("menu", label="Menu", required=False)
-        precisa_voltar = bool(mapa_original) and norm(mapa_original) != norm(mapa_venda)
-        log(s.name, f"🗺️ Mercado: '{mapa_original or 'esse mapa'}' não tem um mercador de "
-                    f"verdade — indo pra '{mapa_venda}' vender, depois volta.")
-        if not await viajar_para(s, mapa_venda):
-            log(s.name, f"⚠️ Mercado: não consegui viajar pra {mapa_venda} pra vender.")
-            return 0
-        # A viagem pode deixar a conta numa tela de transição por um instante
-        # (confirmado pelo usuário via log: 'não achei o botão Loja' logo
-        # depois de chegar) — garante que voltou pro MENU de verdade antes
-        # de tentar clicar em qualquer coisa.
-        await back_to_menu(s)
-        loja_btn = await _achar_mercador_aqui()
-        if not loja_btn:
-            log(s.name, f"⚠️ Mercado: '{mapa_venda}' também não tem mercador — desisti.")
-            if precisa_voltar:
-                await viajar_para(s, mapa_original)
-            return 0
+    entrou, mapa_original, precisa_voltar = await _entrar_na_tela_de_venda(s, rotulo="Mercado")
+    if not entrou:
+        return 0
     try:
-        await s.click(loja_btn, label=loja_btn.text)
-        await s.refresh()
-        if not await s.click_text("vender", label="Vender", required=False):
-            log(s.name, "⚠️ Mercado: não achei o botão 'Vender'.")
-            return 0
         marcados = 0
         # BUG REAL 2026-07-16 (log do usuário: 45 cliques seguidos no MESMO
         # item, sem nunca sair da página 1): o skip de "já marcado" só
@@ -4534,38 +6340,12 @@ async def vender_itens_mercado(s: Session) -> int:
                     break   # a lista pode reordenar após marcar — refaz a varredura
             return marcados_aqui
 
-        def _botao_pagina(anterior: bool):
-            """Acha o botão de virar página (Anterior/Próxima) SEM confundir
-            com o '⬅ Lojas' (voltar/sair da loja) — esse botão também usa
-            seta pra esquerda, e na página 1 (sem 'Anterior' de verdade pra
-            clicar) a busca genérica acabava clicando nele e saindo do
-            mercado inteiro. Agora ignora qualquer botão com 'loja' no texto."""
-            glifos = ("◀️", "◀", "⬅️", "⬅") if anterior else ("➡️", "➡")
-            palavras = ("anterior",) if anterior else ("proxima", "próxima", "avancar", "avançar")
-            for b in iter_buttons(s.message):
-                t = b.text or ""
-                tn = norm(t)
-                if "loja" in tn:
-                    continue
-                if any(g in t for g in glifos) or any(p in tn for p in palavras):
-                    return b
-            return None
-
-        # Garante que a varredura sempre começa da 1ª página de verdade —
-        # a tela de Vender pode abrir já no meio (perto de onde parou da
-        # última vez), então volta com 'Anterior' até não ter mais como
-        # voltar, só depois varre pra frente até o fim.
-        await s.refresh()
-        for _ in range(12):
-            anterior = _botao_pagina(anterior=True)
-            if not anterior:
-                break
-            await s.click(anterior, label="página anterior")
+        await _ir_para_primeira_pagina_venda(s)
 
         for _pagina in range(12):
             await s.refresh()
             await _marcar_pagina_atual(f"pág. {_pagina + 1}")
-            avancar = _botao_pagina(anterior=False)
+            avancar = _botao_pagina_venda(s, anterior=False)
             if not avancar:
                 break
             log(s.name, f"🛒 Mercado: página {_pagina + 1} concluída "
@@ -4597,6 +6377,269 @@ async def vender_itens_mercado(s: Session) -> int:
             await viajar_para(s, mapa_original)
 
 
+# ---------------------------------------------------------------------
+#  🧪 Comprar poções (pedido do usuário 2026-07-21)
+# ---------------------------------------------------------------------
+
+# Nome exato do botão na loja, por tipo pedido no Telegram.
+ITEM_LOJA_POR_TIPO = {
+    "vida": "Poção de Vida", "energia": "Poção de Energia",
+    # 🧪 Super Tônicos (pedido do usuário 2026-07-23) — só vendem no
+    # Mercador do Deserto (Deserto Escaldante), diferente das poções
+    # normais (Planície/Loja da Vila) — ver LOJA_POR_TIPO logo abaixo.
+    "tonico_forca": "Super Tônico de Força",
+    "tonico_precisao": "Super Tônico de Precisão",
+    "tonico_defesa": "Super Tônico de Defesa",
+}
+# Onde CADA tipo é vendido: (mapa, nome_do_botão_da_loja_específica —
+# None se a tela não pedir escolha de loja nesse mapa, como a Planície).
+# Confirmado por prints do usuário: no Deserto Escaldante, "Loja" abre uma
+# escolha ("Mercador do Deserto"/"Matadores"/"Castelo") — diferente da
+# Planície, que às vezes só tem "Loja da Vila" mesmo com só 1 opção.
+LOJA_POR_TIPO = {
+    "vida": ("Planície", "loja da vila"),
+    "energia": ("Planície", "loja da vila"),
+    "tonico_forca": ("Deserto Escaldante", "mercador do deserto"),
+    "tonico_precisao": ("Deserto Escaldante", "mercador do deserto"),
+    "tonico_defesa": ("Deserto Escaldante", "mercador do deserto"),
+}
+COMPRA_MAX_POR_VEZ = 250   # limite da própria tela do jogo por transação
+
+
+async def _abrir_tela_comprar(s: Session, tipo: str, rotulo: str = "Comprar"):
+    """Menu -> viaja pro mapa certo pra ESTE tipo de item (ver LOJA_POR_TIPO
+    — mapa FIXO, diferente da venda, que só viaja se o mapa atual não
+    tiver mercador) -> Loja -> loja específica (se a tela oferecer escolha)
+    -> Comprar. Retorna True se chegou na lista de itens."""
+    mapa_compra, loja_especifica = LOJA_POR_TIPO.get(tipo, (getattr(config, "MERCADO_MAPA_COMPRA", "Planície"), None))
+    await back_to_menu(s)
+    mapa_atual = parse_mapa_do_menu(s.text)
+    if not mapa_atual or norm(mapa_atual) != norm(mapa_compra):
+        log(s.name, f"🗺️ {rotulo}: indo pra '{mapa_compra}' pra comprar.")
+        if not await viajar_para(s, mapa_compra):
+            log(s.name, f"⚠️ {rotulo}: não consegui viajar pra {mapa_compra}.")
+            return False
+        await back_to_menu(s)
+    if not await s.click_text("loja", label="Loja", required=False):
+        log(s.name, f"⚠️ {rotulo}: não achei o botão 'Loja' em {mapa_compra}.")
+        return False
+    await s.refresh()
+    # Se a tela oferecer escolha entre lojas (Loja da Vila/Matadores/
+    # Castelo na Planície; Mercador do Deserto/Matadores/Castelo no
+    # Deserto — prints do usuário confirmaram os dois), entra na loja
+    # ESPECÍFICA de onde este item é vendido.
+    if loja_especifica:
+        btn_loja = find_button(s.message, loja_especifica)
+        if btn_loja:
+            await s.click(btn_loja, label=loja_especifica.title())
+            await s.refresh()
+    if not await s.click_text("comprar", label="Comprar", required=False):
+        log(s.name, f"⚠️ {rotulo}: não achei o botão 'Comprar'.")
+        return False
+    await s.refresh()
+    return True
+
+
+_QTD_COMPRA_RE = re.compile(r"x(\d+)", re.IGNORECASE)
+_GOLD_GASTO_RE = re.compile(r"[-−]?\s*[💰$]?\s*([\d.,]+)\s*Gold", re.IGNORECASE)
+
+
+async def comprar_item_loja(s: Session, tipo: str, quantidade_total: int):
+    """'tipo': 'vida' ou 'energia' (ver ITEM_LOJA_POR_TIPO). Compra em blocos
+    de até COMPRA_MAX_POR_VEZ (limite da tela do jogo) até atingir
+    quantidade_total ou algo impedir (sem gold, item sumiu da loja, etc.).
+    A quantidade é DIGITADA como mensagem de texto — a própria tela aceita
+    isso ('Envie um número entre 1 e 250 aqui no chat', print do usuário),
+    sem precisar destrinchar os atalhos '+100'/'+250'. Retorna (qtd_comprada,
+    gold_gasto) — qtd_comprada pode ser MENOR que quantidade_total se algo
+    interromper no meio (ex: gold acabou)."""
+    nome_item = ITEM_LOJA_POR_TIPO.get(tipo)
+    if not nome_item:
+        log(s.name, f"⚠️ Comprar poções: tipo desconhecido '{tipo}'.")
+        return 0, 0
+    qtd_total = 0
+    gold_total = 0
+    restante = quantidade_total
+    while restante > 0:
+        if not await _abrir_tela_comprar(s, tipo, rotulo=f"Comprar {nome_item}"):
+            break
+        item_btn = find_button(s.message, nome_item)
+        if not item_btn:
+            log(s.name, f"⚠️ Comprar poções: não achei '{nome_item}' na loja.\n"
+                        f"    botões: {button_texts(s.message)}")
+            break
+        await s.click(item_btn, label=nome_item)
+        await s.refresh()
+        if not await s.click_text("escolher quantidade", label="Escolher quantidade", required=False):
+            log(s.name, f"⚠️ Comprar poções: não achei 'Escolher quantidade' pra {nome_item}.")
+            break
+        await s.refresh()
+        chunk = min(COMPRA_MAX_POR_VEZ, restante)
+        _mudou, _msg_qtd = await s.send_text(str(chunk))
+        await poll_sleep()
+        await s.refresh()
+        # Apaga a mensagem com o número que a PRÓPRIA conta mandou — mesmo
+        # cuidado já usado no código da caçada (ver join_caca_por_codigo),
+        # senão o número fica acumulado pra sempre na conversa.
+        try:
+            await _msg_qtd.delete()
+        except Exception:
+            pass
+        if "compra realizada" not in norm(s.text):
+            log(s.name, f"⚠️ Comprar poções: compra de {chunk}x {nome_item} não confirmou "
+                        f"(sem gold? erro?). Tela: {s.text}")
+            break
+        m_qtd = _QTD_COMPRA_RE.search(s.text)
+        m_gold = _GOLD_GASTO_RE.search(s.text)
+        comprado = int(m_qtd.group(1)) if m_qtd else chunk
+        gasto = int(re.sub(r"[.,]", "", m_gold.group(1))) if m_gold else 0
+        qtd_total += comprado
+        gold_total += gasto
+        restante -= comprado
+        if restante > 0:
+            log(s.name, f"🛒 comprou {comprado}x {nome_item} por "
+                        + f"{gasto:,}".replace(",", ".") + " gold "
+                        f"(faltam {restante} pra completar o pedido).")
+        else:
+            log(s.name, f"🛒 comprou {comprado}x {nome_item} por "
+                        + f"{gasto:,}".replace(",", ".") + " gold (pedido completo).")
+        if comprado < chunk:
+            # comprou menos do que pediu (ex: gold acabou no meio) — não
+            # adianta insistir, o próximo bloco falharia do mesmo jeito
+            log(s.name, f"ℹ️ Comprar poções: só deu pra comprar {comprado}/{chunk} "
+                        f"neste bloco — parando por aqui (provável falta de gold).")
+            break
+    await back_to_menu(s)
+    return qtd_total, gold_total
+
+
+async def tentar_comprar_pocao_automatico(s: Session, qtd_atual, rotulo: str = "") -> int:
+    """Compra automática de Poção de Vida ANTES DE INICIAR (pedido do
+    usuário 2026-07-23: "ao identificar isso, já ir comprar a pot? já que
+    já tem o caminho do mercado") — OPCIONAL, desligada por padrão (ver
+    config.POCOES['comprar_automatico']). Só age nos avisos de ANTES de
+    começar (poção baixa detectada antes de entrar na masmorra/caçada/
+    cripta/etc, ainda sem sala aberta) — não tenta durante o combate (a
+    conta precisaria abandonar a sala pra viajar até a loja, mais
+    arriscado; o comportamento de sempre — sair e pausar — continua ali).
+    Retorna a quantidade ATUALIZADA (mesma de antes se a compra estiver
+    desligada, falhou, ou não achou 'qtd_atual' pra comparar)."""
+    if not getattr(config, "POCOES", None) or not config.POCOES.get("comprar_automatico"):
+        return qtd_atual
+    if qtd_atual is None:
+        return qtd_atual
+    alvo = int(config.POCOES.get("reabastecer_ate", 250) or 250)
+    faltam = alvo - qtd_atual
+    if faltam <= 0:
+        return qtd_atual
+    log(s.name, f"🛒 {rotulo}Poção de Vida baixa ({qtd_atual}) — compra automática ligada, "
+                f"tentando comprar {faltam}x pra chegar em {alvo}.")
+    try:
+        comprado, gasto = await comprar_item_loja(s, "vida", faltam)
+    except Exception as e:
+        log(s.name, f"⚠️ {rotulo}compra automática de Poção de Vida falhou: {e!r}")
+        return qtd_atual
+    nova_qtd = qtd_atual + comprado
+    if comprado > 0:
+        log(s.name, f"🛒 {rotulo}compra automática: +{comprado}x Poção de Vida "
+                    + f"({gasto:,}".replace(",", ".") + f" gold) — estoque agora ~{nova_qtd}.")
+    else:
+        log(s.name, f"⚠️ {rotulo}compra automática não conseguiu comprar nada "
+                    f"(sem gold suficiente? item sumiu da loja?).")
+    return nova_qtd
+
+
+async def tentar_comprar_pocao_energia_automatico(s: Session, rotulo: str = "") -> bool:
+    """Compra automática de Poção de Energia (pedido do usuário 2026-07-23:
+    "nas caçadas, solo e em dupla e missão do oásis, tem como fazer isso, só
+    que com as pot de energia?") — OPCIONAL, desligada por padrão (ver
+    config.POCOES['comprar_energia_automatico']). Diferente da de Vida: aqui
+    não tem uma CONTAGEM de estoque prévia (o jogo só mostra quando ACABA,
+    ao não achar mais o botão pra beber no Inventário) — então em vez de
+    'reabastecer até X', compra um LOTE fixo (config.POCOES
+    ['energia_comprar_qtd'], padrão 20 — bem menor que o de Vida, já que
+    Poção de Energia custa MUITO mais: 5000 gold cada, visto em print do
+    usuário, contra 149 da de Vida). Chamada quando energia_reforco_se_baixo/
+    energia_encher_ate não acharem a poção pra beber — se comprar com
+    sucesso, quem chama deve tentar beber de novo. Retorna True se comprou
+    ALGUMA (mesmo que menos que o lote pedido)."""
+    if not getattr(config, "POCOES", None) or not config.POCOES.get("comprar_energia_automatico"):
+        return False
+    qtd = int(config.POCOES.get("energia_comprar_qtd", 20) or 20)
+    if qtd <= 0:
+        return False
+    log(s.name, f"🛒 {rotulo}sem Poção de Energia no estoque — compra automática ligada, "
+                f"tentando comprar {qtd}x.")
+    try:
+        comprado, gasto = await comprar_item_loja(s, "energia", qtd)
+    except Exception as e:
+        log(s.name, f"⚠️ {rotulo}compra automática de Poção de Energia falhou: {e!r}")
+        return False
+    if comprado > 0:
+        log(s.name, f"🛒 {rotulo}compra automática: +{comprado}x Poção de Energia "
+                    + f"({gasto:,}".replace(",", ".") + " gold).")
+        return True
+    log(s.name, f"⚠️ {rotulo}compra automática de energia não conseguiu comprar nada "
+                f"(sem gold suficiente? item sumiu da loja?).")
+    return False
+
+
+async def ler_itens_loja(s: Session) -> int:
+    """LER ITENS DA LOJA (pedido do usuário 2026-07-19: trocar a fonte de
+    '📦 Ler inventário agora' pro Mercado/Loja — o usuário relatou que ler o
+    Inventário 'não lê direito e demora muito'): em vez de abrir o
+    Inventário (6 categorias, várias páginas cada), agora lê direto a MESMA
+    tela 'Vender' que 'vender_itens_mercado' já usa pra vender de verdade —
+    uma lista ÚNICA (sem categorias) com todos os itens vendáveis do
+    jogador, já com a bolinha de raridade — mais rápido e mais confiável
+    que percorrer o Inventário inteiro. NUNCA marca nada pra vender, clica
+    'Vender selecionados' nem confirma venda alguma — só LÊ o texto dos
+    botões (mesma garantia que 'ler_itens_inventario' já tinha). Registra
+    tudo no mesmo banco de itens do Mercado (ver _registrar_itens_no_banco).
+    Retorna quantos itens (distintos, por página) foram vistos."""
+    dados = _ler_relatorio()
+    total = 0
+    entrou, mapa_original, precisa_voltar = await _entrar_na_tela_de_venda(s, rotulo="Ler itens da loja")
+    if not entrou:
+        log(s.name, "⚠️ Ler itens da loja: não consegui abrir a tela de Vender.")
+        return 0
+    try:
+        await _ir_para_primeira_pagina_venda(s)
+        for _pagina in range(12):
+            await s.refresh()
+            raridades = {}
+            for b in iter_buttons(s.message):
+                bt = b.text or ""
+                if norm(bt).startswith("vender selecionados"):
+                    continue
+                cor = next((r for emoji, r in EMOJI_RARIDADE.items() if emoji in bt), None)
+                if not cor:
+                    continue
+                sem_bolinha = bt
+                for emoji in EMOJI_RARIDADE:
+                    sem_bolinha = sem_bolinha.replace(emoji, "")
+                nome, _tem_reforco, _reforco = _item_venda_info(sem_bolinha)
+                if nome:
+                    raridades[nome] = cor
+            if raridades:
+                _registrar_itens_no_banco(dados, raridades, origem="loja")
+                total += len(raridades)
+            avancar = _botao_pagina_venda(s, anterior=False)
+            if not avancar:
+                break
+            log(s.name, f"📦 Ler itens da loja: página {_pagina + 1} concluída "
+                        f"({total} item(ns) vistos até agora) — indo pra próxima…")
+            await s.click(avancar, label="próxima página")
+    finally:
+        await back_to_menu(s)
+        if precisa_voltar:
+            log(s.name, f"🗺️ Ler itens da loja: voltando pra '{mapa_original}'.")
+            await viajar_para(s, mapa_original)
+    _salvar_relatorio(dados)
+    log(s.name, f"📦 Ler itens da loja: {total} item(ns) registrado(s)/atualizado(s) no banco do Mercado.")
+    return total
+
+
 async def talvez_vender_no_mercado(s: Session) -> None:
     """Chamado nos pontos 'a conta está livre' (entre execuções de cada
     conteúdo — nunca no meio de uma masmorra/caçada, pedido do usuário) de
@@ -4610,8 +6653,16 @@ async def talvez_vender_no_mercado(s: Session) -> None:
          passou config.MERCADO_INTERVALO_MIN minutos desde a última venda
          dessa conta (o ciclo automático de sempre)."""
     pedido_ts = vender_agora_timestamp()
-    veio_de_pedido_manual = bool(pedido_ts) and pedido_ts > getattr(s, "_ultimo_pedido_venda_atendido", 0)
-    contas_ok = getattr(config, "MERCADO_CONTAS", None) or []
+    veio_de_pedido_manual = (bool(pedido_ts)
+                              and not _pedido_manual_expirado(pedido_ts)
+                              and pedido_ts > getattr(s, "_ultimo_pedido_venda_atendido", 0)
+                              and not _pedido_ja_servido(VENDER_AGORA_SERVIDO_FILE, s.name, pedido_ts))
+    # Contas ESPECÍFICAS deste pedido (pedido do usuário 2026-07-23: "tem
+    # como selecionar lá quem vende?") — quando o pedido traz uma lista
+    # própria, ela MANDA; sem lista (pedido do painel, ou formato antigo),
+    # vale o padrão de sempre: todas as marcadas em config.MERCADO_CONTAS.
+    contas_pedido = vender_agora_contas() if veio_de_pedido_manual else None
+    contas_ok = contas_pedido if contas_pedido is not None else (getattr(config, "MERCADO_CONTAS", None) or [])
     if contas_ok and s.acc.get("phone") not in contas_ok and s.name not in contas_ok:
         return
     if not veio_de_pedido_manual:
@@ -4625,6 +6676,7 @@ async def talvez_vender_no_mercado(s: Session) -> None:
     s._ultima_venda_mercado = time.time()
     if veio_de_pedido_manual:
         s._ultimo_pedido_venda_atendido = pedido_ts
+        _marcar_pedido_servido(VENDER_AGORA_SERVIDO_FILE, s.name, pedido_ts)
         log(s.name, "🛒 Mercado: atendendo pedido manual de 'Vender agora'.")
     try:
         await vender_itens_mercado(s)
@@ -4635,22 +6687,82 @@ async def talvez_vender_no_mercado(s: Session) -> None:
 async def talvez_ler_inventario(s: Session) -> None:
     """Chamado nos mesmos pontos 'a conta está livre' que talvez_vender_no_
     mercado — só lê o inventário quando há um pedido MANUAL pendente ('📦
-    Ler inventário agora' no painel, ver ler_inventario_timestamp) mais
-    NOVO que o último que esta conta já atendeu. Sem intervalo automático
-    de propósito (ler inventário é bem mais raro de precisar do que vender —
-    só quando o usuário quer popular a lista do Mercado na mão)."""
+    Ler inventário agora' no painel, ver ler_inventario_timestamp) que essa
+    conta AINDA não atendeu — checagem que agora sobrevive a reinício do
+    bot (ver _ler_inventario_ja_servido), não só na memória da sessão atual.
+    Sem intervalo automático de propósito (ler inventário é bem mais raro
+    de precisar do que vender — só quando o usuário quer popular a lista
+    do Mercado na mão)."""
     pedido_ts = ler_inventario_timestamp()
-    if not pedido_ts or pedido_ts <= getattr(s, "_ultimo_pedido_inventario_atendido", 0):
+    if not pedido_ts or _pedido_manual_expirado(pedido_ts):
+        return
+    if pedido_ts <= getattr(s, "_ultimo_pedido_inventario_atendido", 0):
+        return
+    if _ler_inventario_ja_servido(s.name, pedido_ts):
+        s._ultimo_pedido_inventario_atendido = pedido_ts
         return
     contas_ok = getattr(config, "MERCADO_CONTAS", None) or []
     if contas_ok and s.acc.get("phone") not in contas_ok and s.name not in contas_ok:
         return
     s._ultimo_pedido_inventario_atendido = pedido_ts
-    log(s.name, "📦 Mercado: atendendo pedido manual de 'Ler inventário agora'.")
+    _marcar_ler_inventario_servido(s.name, pedido_ts)
+    # Trocado 2026-07-19 (pedido do usuário: ler o Inventário "não lê direito
+    # e demora muito" — mais rápido mapear os itens direto na tela Vender da
+    # Loja, que é uma lista única com tudo, em vez de percorrer as 6
+    # categorias do Inventário). Ver ler_itens_loja.
+    log(s.name, "📦 Mercado: atendendo pedido manual de 'Ler inventário agora' (via loja).")
     try:
-        await ler_itens_inventario(s)
+        await ler_itens_loja(s)
     except Exception as e:
-        log(s.name, f"(Ler inventário: erro — {e!r})")
+        log(s.name, f"(Ler itens da loja: erro — {e!r})")
+
+
+async def talvez_comprar_pocoes(s: Session) -> None:
+    """Chamado nos mesmos pontos 'a conta está livre' que talvez_vender_no_
+    mercado/talvez_ler_inventario (pedido do usuário 2026-07-21: "digito uma
+    quantidade e ele vai na loja e compra?") — só compra quando há um pedido
+    MANUAL pendente (COMPRAR_POCOES_FLAG, escrito pelo '🧪 Comprar Poção de
+    Vida/Energia' do Telegram) que esta conta AINDA não atendeu. Sem
+    intervalo automático de propósito (é uma ação pontual, não um ciclo)."""
+    pedido = comprar_pocoes_pedido(COMPRAR_POCOES_FLAG)
+    if not pedido:
+        return
+    pedido_ts = pedido["ts"]
+    # CORRIGIDO 2026-07-22 (mesmo bug real do 'ler_inventario' de
+    # 2026-07-20, achado agora em 'Comprar poções' também: log do usuário
+    # mostrando contas comprando/vendendo sozinhas após qualquer reinício
+    # do bot, mesmo sem 'MERCADO_ATIVO' e sem pedido feito nessa sessão) —
+    # o controle de "já atendi" só existia na MEMÓRIA da sessão, que
+    # reinicia zerada a cada boot; um COMPRAR_POCOES_FLAG de dias atrás
+    # (nunca apagado) parecia um pedido NOVO de novo. Agora persiste em
+    # disco quais contas já atenderam CADA timestamp — sobrevive a reinício.
+    if (pedido_ts <= getattr(s, "_ultimo_pedido_compra_atendido", 0)
+            or _pedido_manual_expirado(pedido_ts)
+            or _pedido_ja_servido(COMPRAR_POCOES_SERVIDO_FILE, s.name, pedido_ts)):
+        return
+    # Contas ESPECÍFICAS do pedido (pedido do usuário 2026-07-22: "tem como
+    # escolher quais contas quer comprar?") têm prioridade — só cai pra
+    # config.MERCADO_CONTAS (todas as marcadas) se o pedido não trouxer
+    # uma lista própria (None = "não especificou", diferente de [] vazio).
+    contas_pedido = pedido.get("contas")
+    contas_ok = contas_pedido if contas_pedido is not None else (getattr(config, "MERCADO_CONTAS", None) or [])
+    if contas_ok and s.acc.get("phone") not in contas_ok and s.name not in contas_ok:
+        return
+    s._ultimo_pedido_compra_atendido = pedido_ts
+    _marcar_pedido_servido(COMPRAR_POCOES_SERVIDO_FILE, s.name, pedido_ts)
+    tipo = pedido.get("tipo")
+    quantidade = int(pedido.get("quantidade", 0) or 0)
+    nome_item = ITEM_LOJA_POR_TIPO.get(tipo, tipo)
+    if not tipo or quantidade <= 0:
+        return
+    log(s.name, f"🛒 Mercado: atendendo pedido manual de 'Comprar {nome_item}' "
+                f"({quantidade}x).")
+    try:
+        comprado, gasto = await comprar_item_loja(s, tipo, quantidade)
+        log(s.name, f"🛒 Comprar poções: concluído — {comprado}x {nome_item}, "
+                    + f"{gasto:,}".replace(",", ".") + " gold gastos.")
+    except Exception as e:
+        log(s.name, f"(Comprar poções: erro — {e!r})")
 
 
 async def contar_pocoes_vida(s: Session):
@@ -4828,6 +6940,28 @@ async def joiner_entrar_cacada(s: Session, code: str):
         except Exception as e:
             log(s.name, f"(não consegui apagar a mensagem do código: {e!r})")
         return True
+    # BUG REAL corrigido 2026-07-20 (usuário: "bugou na hora de entrar na
+    # sala, tava com energia baixa e não foi encher sozinho" — log real:
+    # tela dizia '⚡️ Você precisa de 10 de energia... (9/40)', e a conta
+    # ficava presa tentando entrar de novo pra sempre, sempre com a mesma
+    # energia baixa). O reforço de energia ANTES de entrar (ver
+    # energia_reforco_se_baixo, chamado pelo run_caca_dupla) usa o limite
+    # CONFIGURADO ("Energia mínima"), que pode estar mais baixo do que o
+    # que o jogo EXIGE de verdade pra entrar — 9 energia passava o reforço
+    # configurado (ex: limite 5), mas o jogo exige 10 fixos só pra entrar.
+    # Agora, se a tela mostrar EXATAMENTE esse aviso, lê quanto o jogo
+    # disse que precisa e bebe Poção de Energia até chegar lá (nem que
+    # passe do limite configurado) — sem isso, a conta nunca sairia desse
+    # ciclo sozinha.
+    m_energia = ENERGIA_NECESSARIA_RE.search(norm(s.text))
+    if m_energia:
+        necessaria = int(m_energia.group(1))
+        log(s.name, f"⚡ o jogo pediu {necessaria} de energia pra entrar na caçada — "
+                    f"bebendo Poção de Energia até chegar lá (o limite configurado deixou "
+                    f"passar um valor menor).")
+        await s.click_text("menu", label="Menu", required=False)
+        await energia_encher_ate(s, necessaria)
+        return False
     log(s.name, f"❌ não confirmei entrada na caçada — verificar print desta tela.\n"
                 f"    texto: {s.text}\n    botões: {button_texts(s.message)}")
     return False
@@ -4855,12 +6989,38 @@ async def read_energia_at_menu(s: Session):
     return energia_atual(s.text)
 
 
+async def _tentar_beber_uma_pocao_energia(s: Session) -> bool:
+    """1 tentativa de beber 1 Poção de Energia pelo Inventário (navega até
+    achar o botão, até 6 vezes) — helper comum de energia_reforco_se_baixo/
+    energia_encher_ate, extraído pra reaproveitar a MESMA lógica antes E
+    depois de uma tentativa de compra automática (pedido do usuário
+    2026-07-23)."""
+    for _ in range(6):
+        await s.refresh()
+        pot = find_button(s.message, "pocao de energia", "poção de energia")
+        if pot:
+            await s.click(pot, label=pot.text)
+            return True
+        cons = find_button(s.message, "consumiveis", "consumíveis")
+        if cons and find_button(s.message, "inventario", "inventário") is None:
+            await s.click(cons, label="Consumíveis")
+            continue
+        inv = find_button(s.message, "inventario", "inventário")
+        if inv:
+            await s.click(inv, label="Inventário")
+            continue
+    return False
+
+
 async def energia_reforco_se_baixo(s: Session, energia_minima: int, pocoes_reforco: int) -> bool:
     """No MENU, ao final de uma caçada: se a energia estiver abaixo de
     'energia_minima', bebe 'pocoes_reforco' Poções de Energia pelo
     Inventário (mesmo padrão de heal_at_menu_if_low, com Poção de Energia).
     Retorna False se precisava beber e NÃO conseguiu (acabaram as poções) —
-    quem chama deve pausar o bot nesse caso."""
+    quem chama deve pausar o bot nesse caso. Antes de desistir de vez,
+    tenta COMPRAR mais (pedido do usuário 2026-07-23: "nas caçadas, solo e
+    em dupla e missão do oásis, tem como fazer isso, só que com as pot de
+    energia?" — opcional, ver tentar_comprar_pocao_energia_automatico)."""
     await back_to_menu(s)
     en = energia_atual(s.text)
     if not en or en[0] >= energia_minima:
@@ -4869,22 +7029,10 @@ async def energia_reforco_se_baixo(s: Session, energia_minima: int, pocoes_refor
                 f"{pocoes_reforco} Poção(ões) de Energia.")
     bebidas = 0
     for _ in range(pocoes_reforco):
-        usou = False
-        for _ in range(6):
-            await s.refresh()
-            pot = find_button(s.message, "pocao de energia", "poção de energia")
-            if pot:
-                await s.click(pot, label=pot.text)
-                usou = True
-                break
-            cons = find_button(s.message, "consumiveis", "consumíveis")
-            if cons and find_button(s.message, "inventario", "inventário") is None:
-                await s.click(cons, label="Consumíveis")
-                continue
-            inv = find_button(s.message, "inventario", "inventário")
-            if inv:
-                await s.click(inv, label="Inventário")
-                continue
+        usou = await _tentar_beber_uma_pocao_energia(s)
+        if not usou and await tentar_comprar_pocao_energia_automatico(s, rotulo="Caçada em Dupla: "):
+            await back_to_menu(s)
+            usou = await _tentar_beber_uma_pocao_energia(s)
         if not usou:
             log(s.name, f"⚠️ não consegui achar Poção de Energia. botões: {button_texts(s.message)}")
             break
@@ -4897,31 +7045,22 @@ async def energia_reforco_se_baixo(s: Session, energia_minima: int, pocoes_refor
 async def energia_encher_ate(s: Session, energia_alvo: int) -> bool:
     """No MENU: bebe Poções de Energia (uma por vez, pelo Inventário) até a
     energia chegar em 'energia_alvo' (ou acabarem as poções). Usado pela
-    Caçada Solo (diferente da Caçada em Dupla, que bebe uma QUANTIDADE fixa —
-    aqui é 'encher até X', pedido do usuário). Retorna False se ainda ficou
-    abaixo do alvo por falta de poção (quem chama deve pausar nesse caso)."""
+    Caçada Solo e Missão Oásis (diferente da Caçada em Dupla, que bebe uma
+    QUANTIDADE fixa — aqui é 'encher até X', pedido do usuário). Retorna
+    False se ainda ficou abaixo do alvo por falta de poção (quem chama deve
+    pausar nesse caso). Antes de desistir de vez, tenta COMPRAR mais
+    (pedido do usuário 2026-07-23 — opcional, ver
+    tentar_comprar_pocao_energia_automatico)."""
     await back_to_menu(s)
     en = energia_atual(s.text)
     if not en:
         return True
     bebidas = 0
     while en and en[0] < energia_alvo:
-        usou = False
-        for _ in range(6):
-            await s.refresh()
-            pot = find_button(s.message, "pocao de energia", "poção de energia")
-            if pot:
-                await s.click(pot, label=pot.text)
-                usou = True
-                break
-            cons = find_button(s.message, "consumiveis", "consumíveis")
-            if cons and find_button(s.message, "inventario", "inventário") is None:
-                await s.click(cons, label="Consumíveis")
-                continue
-            inv = find_button(s.message, "inventario", "inventário")
-            if inv:
-                await s.click(inv, label="Inventário")
-                continue
+        usou = await _tentar_beber_uma_pocao_energia(s)
+        if not usou and await tentar_comprar_pocao_energia_automatico(s):
+            await back_to_menu(s)
+            usou = await _tentar_beber_uma_pocao_energia(s)
         if not usou:
             log(s.name, f"⚠️ não consegui achar Poção de Energia (parei em {en[0]}/{en[1]}).")
             break
@@ -5042,6 +7181,55 @@ def is_mercador_viajante_solo(text: str) -> bool:
 def is_goblin_gibby_solo(text: str) -> bool:
     n = norm(text or "")
     return "goblin gibby" in n or ("encontro raro" in n and "martelo" in n)
+
+
+def is_coveiro_huaguilli_solo(text: str) -> bool:
+    """NPC do Cemitério Antigo (confirmado por print do usuário 2026-07-21):
+    'Coveiro Huaguilli' vende o 'Colar da Paz' — reduz a perda de XP ao
+    morrer pra 2% (some depois de 1 uso). Pedido do usuário: comprar
+    SEMPRE que esse NPC aparecer, caçando normal ou no modo dedicado
+    ('cemiterio_so_colar')."""
+    n = norm(text or "")
+    return "coveiro huaguilli" in n or "colar da paz" in n
+
+
+def is_bau_tesouro_solo(text: str) -> bool:
+    """Evento de sorte '✨ TESOURO ENCONTRADO! ✨ ... Baú do Tesouro x1'
+    (confirmado por print do usuário 2026-07-21) — só reconhece/loga por
+    enquanto (pedido do usuário: o baú fica no Inventário sem pressa,
+    abre na aba Ferramentas manualmente; um botão pra abrir sozinho pode
+    vir depois)."""
+    n = norm(text or "")
+    return "tesouro encontrado" in n or "bau do tesouro" in n
+
+
+POEIRA_ESTELAR_QTD_RE = re.compile(r"coletou:\s*(\d+)\s*x\s*poeira estelar", re.IGNORECASE)
+
+
+def parse_qtd_poeira_estelar(text: str) -> int:
+    """Quantidade de Poeira Estelar coletada num evento 'Estrela Caída'.
+    Prioridade: 1) o texto 'Você coletou: Nx Poeira Estelar' (mais direto);
+    2) se não bater por algum motivo, conta as estrelinhas 🌟 do título
+    (confirmado pelo usuário 2026-07-21: a quantidade de 🌟 no título JÁ
+    simboliza a quantidade — 1 estrela = 1 poeira, 2 = 2, 3 = 3 — dá pra
+    usar como reforço/alternativa caso o formato do texto mude)."""
+    m = POEIRA_ESTELAR_QTD_RE.search(norm(text or ""))
+    if m:
+        return int(m.group(1))
+    qtd_estrelas = (text or "").count("🌟")
+    return max(1, qtd_estrelas)
+
+
+def is_estrela_caida_solo(text: str) -> bool:
+    """Evento de sorte do Deserto Escaldante — '🌟🌟 Estrela Caída! Uma
+    estrela média cruza o céu do deserto e cai próxima a você! ✨ Você
+    coletou: 2x Poeira Estelar' (confirmado por print do usuário 2026-07-21
+    — nome certo é 'Poeira ESTELAR', sem o 'r' do meio; alguns comentários
+    mais antigos no código ainda diziam 'Estrelar', mas o jogo mesmo usa
+    'Estelar'). Sem ação nenhuma do bot — só acontece sozinho, quantidade
+    (1 a 3) varia por sorte; ver registrar_poeira_estelar."""
+    n = norm(text or "")
+    return "estrela caida" in n or "poeira estelar" in n
 
 
 # ---------------------------------------------------------------------
@@ -5185,6 +7373,19 @@ def is_compra_realizada_solo(text: str) -> bool:
     return "compra realizada" in norm(text or "")
 
 
+def is_tela_sem_hp_solo(text: str) -> bool:
+    """Telas conhecidas da Caçada Solo que legitimamente NÃO mostram o HP
+    do personagem, mas têm um botão 'Caçar de novo' válido (confirmado por
+    prints do usuário 2026-07-21): confirmação de compra do Mercador do
+    Deserto ('✅ Você comprou Super Tônico...'), o evento 'Baú do Tesouro'
+    ('✨ TESOURO ENCONTRADO!') e o evento 'Estrela Caída' (Poeira Estelar).
+    Não é erro de leitura nenhum — essas telas simplesmente não têm HP pra
+    ler; usado pra NÃO disparar o aviso de 'HP não lido' à toa nelas."""
+    n = norm(text or "")
+    return ("voce comprou" in n or "compra realizada" in n or "tesouro encontrado" in n
+            or "estrela caida" in n or "poeira estelar" in n)
+
+
 def parse_monstro_nome_solo(text: str):
     """Nome do MONSTRO na tela de combate solo. Ele aparece ANTES de 'Você',
     numa linha com um emoji na frente, seguida (na mesma linha ou na próxima)
@@ -5268,9 +7469,13 @@ def parse_hp_voce_solo(text: str, s: "Session" = None):
 def parse_resultado_caca_solo(text: str):
     """Lê a tela de '🏆 Vitória!' (+XP, +Gold, e Drops se houver, cor de
     raridade igual à Caçada em Dupla) -> (xp, gold, drops, raridades).
-    Dois formatos de item vistos: uma seção 'Drops:' com uma linha por item
-    (igual a Caçada em Dupla), OU uma linha solta '🎁 Item: Nome (DEF+7,
-    HP+15)' (equipamento, sem seção 'Drops:' nenhuma) — os dois são pegos."""
+    TRÊS formatos de item vistos: uma seção 'Drops:' com uma linha por item
+    (igual a Caçada em Dupla); uma linha solta '🎁 Item: Nome (DEF+7,
+    HP+15)' (equipamento, sem seção 'Drops:' nenhuma); ou uma linha solta
+    só com a bolinha de raridade + nome + descrição entre parênteses, tipo
+    '🟠 Manto de Thoth (Passiva: Explosão Solar)' (pedido do usuário
+    2026-07-23 — itens raros dos 3 bosses do Deserto Escaldante, sem
+    'Drops:' nem 'Item:' na frente) — os três são pegos."""
     n = norm(text or "")
     mxp = re.search(r"\+\s*([\d.,]+)\s*xp", n)
     mgold = re.search(r"\+\s*([\d.,]+)\s*gold", n)
@@ -5292,26 +7497,50 @@ def parse_resultado_caca_solo(text: str):
                 if cor:
                     raridades[nome_item] = cor
 
-    capturando = False
+    dentro_de_drops = False
     for linha in (text or "").splitlines():
         l = linha.strip()
-        if not capturando:
-            if "drops" in norm(l):
-                capturando = True
+        if "drops" in norm(l):
+            dentro_de_drops = True
             continue
-        if not l or "cacar de novo" in norm(l) or "menu" in norm(l):
-            break
-        cor = next((r for emoji, r in EMOJI_RARIDADE.items() if emoji in l), None)
-        m = re.match(r"^[^\wÀ-ÿ]*(.+?)(?:\s*×\s*(\d+))?$", l)
-        if not m:
+        if dentro_de_drops:
+            if not l or "cacar de novo" in norm(l) or "menu" in norm(l):
+                dentro_de_drops = False
+                continue
+            cor = next((r for emoji, r in EMOJI_RARIDADE.items() if emoji in l), None)
+            m = re.match(r"^[^\wÀ-ÿ]*(.+?)(?:\s*×\s*(\d+))?$", l)
+            if not m:
+                continue
+            nome = m.group(1).strip()
+            if not nome:
+                continue
+            qtd = int(m.group(2)) if m.group(2) else 1
+            drops.extend([nome] * qtd)
+            if cor:
+                raridades[nome] = cor
             continue
-        nome = m.group(1).strip()
-        if not nome:
+
+        # 3º formato, SÓ fora da seção 'Drops:' (evita reprocessar/duplicar
+        # linhas que o bloco acima já cuida direito, com quantidade ×N
+        # inclusive): "🟠 Nome do Item (Passiva: X)" — item de boss raro
+        # (pedido do usuário 2026-07-23, prints mostrando "Manto de Thoth
+        # (Passiva: Explosão Solar)"/"Vestes de Neith (Passiva: Cegueira
+        # Solar)", dropados pelos bosses do Deserto Escaldante) — aparece
+        # SOLTO no corpo da tela de Vitória, sem 'Drops:' nem 'Item:' na
+        # frente — só a bolinha de raridade, o nome, e uma descrição entre
+        # parênteses (Passiva ou stats) que NÃO faz parte do nome.
+        cor_solta = next((EMOJI_RARIDADE[emoji] for emoji in EMOJI_RARIDADE if l.startswith(emoji)), None)
+        if not cor_solta:
             continue
-        qtd = int(m.group(2)) if m.group(2) else 1
-        drops.extend([nome] * qtd)
-        if cor:
-            raridades[nome] = cor
+        resto = l
+        for emoji in EMOJI_RARIDADE:
+            if resto.startswith(emoji):
+                resto = resto[len(emoji):].strip()
+                break
+        nome_item = re.sub(r"\s*\(.*\)\s*$", "", resto).strip()
+        if nome_item and nome_item not in drops:
+            drops.append(nome_item)
+            raridades[nome_item] = cor_solta
     return xp, gold, drops, raridades
 
 
@@ -5357,10 +7586,12 @@ async def _tentar_curar_se_precisar(s: Session, limite: float, contexto: str):
 
 async def act_combate_solo(s: Session, brain) -> bool:
     """1 ação de combate na Caçada Solo (cada clique resolve na hora, sem
-    ampulheta). dps/lanceiro/arqueiro/berserker atacam E usam alma; tank/
-    suporte só atacam (papel deles aqui é só aguentar/curar, sem alma de
-    aggro — a Caçada Solo não tem mecânica de grupo). Todos curam quando o
-    HP cai abaixo do % configurado pra essa conta. Também tenta usar Super
+    ampulheta). TODOS os papéis atacam E usam alma (mudou 2026-07-22 —
+    antes só dps/lanceiro/arqueiro/berserker usavam alma aqui, tank/suporte
+    só atacavam; a Solo não tem mecânica de aggro/grupo, então reservar
+    alma só pros papéis "de ataque" não fazia sentido — tank/suporte também
+    têm almas de cura/dano que ajudam sozinhos). Todos curam quando o HP
+    cai abaixo do % configurado pra essa conta. Também tenta usar Super
     Tônico e Elixir de Sabedoria a cada rodada (se configurados e já tiver
     passado o intervalo de cada um — ver try_tonico/try_elixir).
     Se a conta tiver 'so_bosses_deserto' ligado E estiver caçando no Deserto
@@ -5405,12 +7636,28 @@ async def act_combate_solo(s: Session, brain) -> bool:
 
     # Log do HP/ratio/limite em TODA rodada (bebendo ou não) — mesmo formato
     # já usado no _act_other da Masmorra/Caçada em Dupla ('🩺 HP=... ratio=...
-    # limite=... -> ...'), que faltava aqui. Só visibilidade, não muda a
-    # decisão (ela é tomada logo abaixo, igual antes).
+    # limite=... -> ...'), que faltava aqui. Dano sofrido nesta rodada
+    # (pedido do usuário 2026-07-21: "tem como sempre informar o dano
+    # sofrido?") sempre aparece, mesmo 0 — dá pra acompanhar rodada a
+    # rodada quanto cada hit tirou, sem precisar adivinhar pelo HP.
+    # MAIOR entre diferença de HP e parse de evento (pedido do usuário
+    # 2026-07-23 — ver comentário completo no _act_tank da Masmorra).
+    hp_anterior_solo = getattr(s, "_hp_anterior_solo", None)
+    dano_por_diferenca = max(0, hp_anterior_solo - cur) if (hp_anterior_solo is not None and cur is not None) else 0
+    dano_por_evento = damage_to_me(s.text, s.char)
+    dano_solo_rodada = max(dano_por_diferenca, dano_por_evento)
+    if cur is not None:
+        s._hp_anterior_solo = cur
     log(s.name, f"🩺 HP={cur if cur is not None else '?'} "
                 f"ratio={('%.0f%%' % (ratio * 100)) if ratio is not None else 'NÃO LIDO'} "
-                f"limite={limite * 100:.0f}% -> "
+                f"limite={limite * 100:.0f}% "
+                f"· dano sofrido: {dano_solo_rodada} -> "
                 f"{'BEBER poção' if (ratio is not None and ratio <= limite) else 'ok, não bebe'}")
+    if ratio is None:
+        # DIAGNÓSTICO — mesmo motivo das outras 2 (pedido do usuário
+        # 2026-07-20: "tá mt errado a leitura dos hp").
+        if getattr(config, "LOG_DEBUG_VERBOSE", False):
+            log(s.name, f"🔍 DEBUG HP não lido — texto cru:\n{s.text}")
 
     # --- Filtro DESERTO ESCALDANTE, POR CONTA: 3 modos possíveis —
     # 'geral' (luta com tudo, padrão), 'bosses' (só os 3 bosses raros, foge
@@ -5433,6 +7680,21 @@ async def act_combate_solo(s: Session, brain) -> bool:
             await act_fugir(s)
             return True
 
+    # --- Filtro CEMITÉRIO ANTIGO, POR CONTA: 'cemiterio_so_colar' (pedido
+    # do usuário 2026-07-21) — foge de TODO mob normal, igual o modo
+    # 'Poeira Estrelar' do Deserto acima, só que aqui o motivo é ficar de
+    # olho esperando o NPC 'Coveiro Huaguilli' aparecer (vende o Colar da
+    # Paz) sem perder tempo/energia lutando com mob nenhum. A compra em si
+    # já é tratada em tratar_evento_solo() (sempre compra, com ou sem esse
+    # modo ligado) — aqui só cuida de EVITAR combate normal quando o modo
+    # está ativo.
+    no_cemiterio = getattr(s, "mapa_caca_solo", "") == "Cemitério Antigo"
+    if s.acc.get("cemiterio_so_colar") and no_cemiterio and nome_mob:
+        log(s.name, f"⚰️ modo só Colar da Paz — fugindo de '{nome_mob}' "
+                    f"(esperando o Coveiro Huaguilli aparecer).")
+        await act_fugir(s)
+        return True
+
     # --- Filtro "ALVO ÚNICO", SÓ NO OÁSIS PERDIDO (contas[i]["alvo_oasis"] =
     # nome de um monstro): a conta só luta contra ESSE monstro escolhido e
     # FOGE de qualquer outro do mapa — depois de fugir, o loop de fora já
@@ -5445,6 +7707,24 @@ async def act_combate_solo(s: Session, brain) -> bool:
     if alvo_oasis and no_oasis and nome_mob:
         if norm(nome_mob) != norm(alvo_oasis):
             log(s.name, f"🏃 '{nome_mob}' não é o alvo escolhido ({alvo_oasis}) — fugindo.")
+            await act_fugir(s)
+            return True
+
+    # --- Filtro "ALVO ÚNICO", SÓ NA PLANÍCIE (contas[i]["alvo_planicie"] =
+    # nome de um monstro) — pedido do usuário 2026-07-22: "aquilo dos bosses
+    # no deserto... fazer semelhante agora na planície, pra só matar um mob
+    # específico". Mesmo mecanismo do Oásis Perdido acima (não uma lista
+    # fixa de bosses como o Deserto): a conta só luta contra ESSE monstro
+    # escolhido e foge de qualquer outro do mapa; o loop de fora já clica
+    # 'Caçar de novo' sozinho, então ela volta a procurar até o alvo
+    # aparecer de novo. alvo_planicie="" (padrão) = luta com tudo, igual
+    # antes. Só tem efeito se a conta estiver mesmo caçando na Planície; em
+    # qualquer outro mapa, ignora esse campo.
+    alvo_planicie = (s.acc.get("alvo_planicie") or "").strip()
+    na_planicie = getattr(s, "mapa_caca_solo", "") == "Planície"
+    if alvo_planicie and na_planicie and nome_mob:
+        if norm(nome_mob) != norm(alvo_planicie):
+            log(s.name, f"🏃 '{nome_mob}' não é o alvo escolhido ({alvo_planicie}) — fugindo.")
             await act_fugir(s)
             return True
 
@@ -5465,6 +7745,25 @@ async def act_combate_solo(s: Session, brain) -> bool:
         boss_floresta = getattr(config, "BOSS_FLORESTA_PROFUNDA", "")
         if boss_floresta and norm(nome_mob) == norm(boss_floresta):
             log(s.name, f"🏃 '{nome_mob}' é o Boss da Floresta Profunda — fugindo "
+                        f"(config: fugir do boss ligado).")
+            await act_fugir(s)
+            return True
+
+    # --- Filtro "FUGIR DO BOSS", SÓ EM MONTANHAS GÉLIDAS (contas[i]
+    # ["fugir_boss_montanha"] = True/False): pedido do usuário 2026-07-19,
+    # mesmo princípio já usado na Floresta Profunda (ver acima) — o Boss de
+    # Montanhas Gélidas ('Grimmrok, o Eterno Inverno', config.BOSS_MONTANHAS_
+    # GELIDAS) é bem mais forte que os monstros comuns do mapa. Com o flag
+    # ligado, foge SÓ desse boss e continua lutando normal com os outros
+    # monstros. Desligado (padrão) = luta com tudo, igual antes. Só tem
+    # efeito quando a conta está mesmo caçando em Montanhas Gélidas — em
+    # qualquer outro mapa, ignora esse campo.
+    fugir_boss_montanha = bool(s.acc.get("fugir_boss_montanha"))
+    na_montanha = getattr(s, "mapa_caca_solo", "") == "Montanhas Gélidas"
+    if fugir_boss_montanha and na_montanha and nome_mob:
+        boss_montanha = getattr(config, "BOSS_MONTANHAS_GELIDAS", "")
+        if boss_montanha and norm(nome_mob) == norm(boss_montanha):
+            log(s.name, f"🏃 '{nome_mob}' é o Boss de Montanhas Gélidas — fugindo "
                         f"(config: fugir do boss ligado).")
             await act_fugir(s)
             return True
@@ -5523,12 +7822,22 @@ async def act_combate_solo(s: Session, brain) -> bool:
     if await try_elixir(s):
         return True
 
-    if s.role in ("dps", "lanceiro", "arqueiro", "berserker"):
-        r = await _tentar_curar_se_precisar(s, limite, "Alma")
-        if r is not None:
-            return r
-        if await use_soul_from_priority(s, brain, s.souls, forcar=brain.deve_forcar_resync_alma()):
-            return True
+
+    # TODOS os papéis usam alma na Caçada Solo (pedido do usuário 2026-07-22:
+    # "eles são justamente tank e suporte... mude pra usarem almas, pq eles
+    # têm almas que curam (evita usar mt poção) e almas que dão dano
+    # também"). Antes só dps/lanceiro/arqueiro/berserker usavam (tank/
+    # suporte ficavam só no Atacar) — fazia sentido na Masmorra/Caçada em
+    # Dupla, onde a alma do tank é de AGGRO (Rugido etc., não faz sentido
+    # sozinho sem grupo pra proteger), mas a Solo não tem mecânica de grupo
+    # e as almas configuradas pra essas contas podem ser bem diferentes
+    # (cura, dano) — não há motivo pra reservar exclusivamente pros 4
+    # papéis "de ataque".
+    r = await _tentar_curar_se_precisar(s, limite, "Alma")
+    if r is not None:
+        return r
+    if await use_soul_from_priority(s, brain, s.souls, forcar=brain.deve_forcar_resync_alma()):
+        return True
 
     r = await _tentar_curar_se_precisar(s, limite, "Atacar")
     if r is not None:
@@ -5609,6 +7918,18 @@ async def tratar_evento_solo(s: Session) -> None:
     if is_goblin_gibby_solo(txt):
         log(s.name, "🛒 Goblin Gibby apareceu — comprando o Martelo Mágico.")
         await s.click_text("comprar", label="Comprar (Martelo)", required=False)
+        return
+    if is_coveiro_huaguilli_solo(txt):
+        log(s.name, "🛒 Coveiro Huaguilli apareceu — comprando o Colar da Paz.")
+        await s.click_text("comprar", label="Comprar (Colar da Paz)", required=False)
+        return
+    if is_bau_tesouro_solo(txt):
+        # Pedido do usuário 2026-07-21: só reconhecer/logar por enquanto —
+        # o Baú fica no Inventário sem pressa (abre na aba Ferramentas
+        # manualmente, sem prazo pra expirar). Sem ação nenhuma aqui; o
+        # fluxo normal já clica 'Caçar de novo' depois que esta função
+        # retorna, igual faria com qualquer evento sem NPC conhecido.
+        log(s.name, "🎁 Baú do Tesouro encontrado (guardado no Inventário — abrir na aba Ferramentas quando quiser).")
         return
 
 
@@ -5760,6 +8081,22 @@ async def run_caca_solo_conta(s: Session, baseline: int = 0) -> bool:
         try:
             await s.refresh()
 
+            # ⏸️ Pausar 1 conta só (pedido do usuário 2026-07-23) — conteúdo
+            # INDEPENDENTE (cada conta caça sozinha), então pausar esta NÃO
+            # afeta as outras contas rodando em paralelo. Só ela fica
+            # esperando (log 1x quando pausa, não a cada rodada) até
+            # alguém despausar pelo Telegram.
+            if conta_pausada(s.name):
+                if not getattr(s, "_pausa_avisada", False):
+                    log(tag, "⏸️ conta pausada pelo Telegram — esperando ser retomada "
+                             "(as outras contas continuam normalmente).")
+                    s._pausa_avisada = True
+                await asyncio.sleep(5.0)
+                continue
+            if getattr(s, "_pausa_avisada", False):
+                log(tag, "▶️ conta retomada — voltando a caçar.")
+                s._pausa_avisada = False
+
             if await escolher_submenu_caca_solo(s):
                 sem_reconhecer = 0
                 await asyncio.sleep(config.ACTION_DELAY)
@@ -5773,6 +8110,7 @@ async def run_caca_solo_conta(s: Session, baseline: int = 0) -> bool:
                 # pra 2ª página dos Consumíveis se o tônico estiver lá.
                 await try_tonico(s)
                 await try_elixir(s)
+                write_status_extra(s.name, chaves_masmorra=keys_count(s.text), vip_ate=vip_ate(s.text))
                 await s.refresh()
                 en = energia_atual(s.text)
                 if en and en[0] < energia_minima:
@@ -5861,6 +8199,8 @@ async def run_caca_solo_conta(s: Session, baseline: int = 0) -> bool:
             reconheceu = (is_vitoria_solo(txt) or is_armadilha_solo(txt)
                           or is_compra_realizada_solo(txt) or is_mercador_deserto_solo(txt)
                           or is_mercador_viajante_solo(txt) or is_goblin_gibby_solo(txt)
+                          or is_coveiro_huaguilli_solo(txt) or is_bau_tesouro_solo(txt)
+                          or is_estrela_caida_solo(txt)
                           or bool(_botao_caca_de_novo(s)))
             if not reconheceu:
                 # Tela não reconhecida (ex: chat ficou vazio depois da limpeza
@@ -5902,6 +8242,14 @@ async def run_caca_solo_conta(s: Session, baseline: int = 0) -> bool:
                          f"({feitas} desta conta desde que iniciou).")
             elif is_armadilha_solo(txt):
                 log(tag, "⚠️ caí numa armadilha.")
+            elif is_estrela_caida_solo(txt):
+                qtd_poeira = parse_qtd_poeira_estelar(txt)
+                try:
+                    total_poeira = registrar_poeira_estelar(s.name, qtd_poeira)
+                    log(tag, f"🌟 Estrela Caída! Coletou {qtd_poeira}x Poeira Estelar "
+                             f"(#{total_poeira} no total acumulado).")
+                except Exception as e:
+                    log(tag, f"(não consegui registrar a Poeira Estelar: {e!r})")
 
             await tratar_evento_solo(s)
 
@@ -5912,6 +8260,31 @@ async def run_caca_solo_conta(s: Session, baseline: int = 0) -> bool:
             # segurança (0 = desligada).
             await s.refresh()
             cur, hp_max = parse_hp_voce_solo(s.text, s)
+            # BUG REAL corrigido 2026-07-20 (usuário: "setei 150 de HP mín.
+            # após armadilha, caiu em armadilha, não bebeu poção, foi direto
+            # pra outra caçada" — SEM cur lido, as duas checagens abaixo
+            # (%HP e HP real) ficam mudas e NADA é logado, então o problema
+            # passava despercebido). Se a 1ª leitura falhar bem na hora que
+            # a tela ainda pode estar mudando (ex: API do Telegram lenta),
+            # tenta mais 1 vez antes de desistir — e SE ainda assim falhar,
+            # loga a tela crua pra dar pra confirmar a causa de verdade.
+            if cur is None:
+                await asyncio.sleep(config.ACTION_DELAY)
+                await s.refresh()
+                cur, hp_max = parse_hp_voce_solo(s.text, s)
+                if cur is None and is_tela_sem_hp_solo(s.text):
+                    # CORRIGIDO 2026-07-21 (a versão anterior daqui partia
+                    # de uma suposição ERRADA — que essa tela não tinha
+                    # botão e precisava ser apagada; print do usuário
+                    # mostrou que ela TEM um 'Caçar de novo' válido, só não
+                    # mostra HP por design — é a confirmação do Mercador do
+                    # Deserto ('✅ Você comprou...') ou o evento 'Baú do
+                    # Tesouro'). Não é erro nenhum: só não tem HP pra ler
+                    # mesmo. Aceita e segue — sem debug, sem apagar nada.
+                    pass
+                elif cur is None:
+                    if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                        log(tag, f"🔍 DEBUG HP não lido após armadilha/evento — texto cru:\n{s.text}")
             ratio = (cur / hp_max) if (cur is not None and hp_max) else None
             hp_min_armadilha = int(getattr(config, "CACA_SOLO", {}).get("hp_minimo_armadilha", 0) or 0)
             precisa_curar = (ratio is not None and ratio <= s.caca_vida_ratio) or (
@@ -5937,17 +8310,35 @@ async def run_caca_solo_conta(s: Session, baseline: int = 0) -> bool:
                 registrar_pausa("parar_no_fim", f"{s.name}: após concluir a caçada atual")
                 return False
 
+            # Lê o Perfil (nível/XP/energia/etc.) já NA 1ª execução também
+            # (pedido do usuário 2026-07-20: "continua só mostrando a barra
+            # de HP, não mostra energia nem XP" — como esses campos só
+            # populam depois que atualizar_perfil_e_estimativa roda pelo
+            # menos 1x, e antes isso só acontecia na 3ª execução, reiniciar
+            # o bot com frequência pra testar mudanças fazia o contador
+            # nunca chegar lá — os campos ficavam None pra sempre). Continua
+            # a cada 3ª depois disso, só a 1ª que ficou mais cedo.
             s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
-            if s._contador_perfil % 3 == 0:
+            if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
                 await atualizar_perfil_e_estimativa(s, chave_tempo=f"caca_solo:{s.name}")
             await talvez_vender_no_mercado(s)
             await talvez_ler_inventario(s)
+            await talvez_comprar_pocoes(s)
             _c = player_hp(s.text, s.char)
             if _c:
                 write_status(s.name, _c[0], _c[1], f"{feitas} caça(s)",
                              inicio_ts=getattr(s, "_t_inicio_conteudo", None),
                              nivel=getattr(s, "_nivel", None), xp_faltam=getattr(s, "_xp_faltam", None),
-                             eta_proximo_nivel_seg=getattr(s, "_eta_proximo_nivel_seg", None))
+                             xp_atual=getattr(s, "_xp_atual", None),
+                             eta_proximo_nivel_seg=getattr(s, "_eta_proximo_nivel_seg", None),
+                             atk=getattr(s, "_atk", None), defesa=getattr(s, "_def", None),
+                             crit=getattr(s, "_crit", None),
+                             energia=getattr(s, "_energia_atual", None),
+                             energia_max=getattr(s, "_energia_max", None),
+                             buff_texto=getattr(s, "_buff_texto", None),
+                             monstro_nome=getattr(s, "_ultimo_mob_combate", None),
+                             estoque_pocao_vida=getattr(s, "pocoes_estimadas", None),
+                             xp_pct_nivel=getattr(s, "_xp_pct_nivel", None))
 
             b = _botao_caca_de_novo(s)
             if b:
@@ -6024,10 +8415,21 @@ async def observar_conta(s: Session) -> None:
                     continue
                 vistos.add(h)
                 for j in bloco["jogadores"]:
-                    registrar_observado(j["nome"], j["gold"], j["xp"], j["item"],
+                    # gold/xp são do KILL (não de cada item) — só somam na
+                    # 1ª chamada; se vier mais de 1 item no mesmo kill (ver
+                    # _extrair_itens_recompensa), as próximas chamadas vão
+                    # com gold=0/xp=0 pra não contar 2x.
+                    itens = j.get("itens") or []
+                    primeiro = itens[0] if itens else None
+                    registrar_observado(j["nome"], j["gold"], j["xp"],
+                                       primeiro["nome"] if primeiro else None,
+                                       raridade=(primeiro or {}).get("raridade"),
                                        monstro=bloco["monstro"])
-                    if j["item"]:
-                        log(s.name, f"✨ {j['nome']} ganhou '{j['item']}' "
+                    for it in itens[1:]:
+                        registrar_observado(j["nome"], 0, 0, it["nome"],
+                                           raridade=it.get("raridade"), monstro=bloco["monstro"])
+                    for it in itens:
+                        log(s.name, f"✨ {j['nome']} ganhou '{it['nome']}' "
                                     f"(vs {bloco['monstro']}) — registrado.")
         except Exception as e:
             log(s.name, f"⚠️ observador: erro lendo a tela ({e!r}) — tentando de novo.")
@@ -6086,6 +8488,17 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
     focar_nurmora = bool(s.acc.get("focar_nurmora", False))
     if focar_nurmora:
         fazer_nurmora = True
+    # Meta de Martelos (pedido do usuário 2026-07-23: "queria outra
+    # janelinha pra digitar a quantidade de martelos... esse valor só
+    # contar quando apenas a nurmora está ativa, pq se não vai dar
+    # conflito, quando tiver fazendo a missão e tiver com a nurmora
+    # ativa") — só tem efeito no modo 'Só Nurmora' (focar_nurmora=True);
+    # no modo '+ Nurmora' (os dois ao mesmo tempo) essa meta é ignorada de
+    # propósito, pra não conflitar/interromper uma busca do Sunred em
+    # andamento. 0 = sem limite. Conta martelos recebidos NESTA sessão
+    # (zera a cada novo início do bot, não é vitalício).
+    meta_martelos = int(s.acc.get("meta_martelos", 0) or 0) if focar_nurmora else 0
+    martelos_sessao = getattr(s, "_martelos_sessao", 0)
     energia_minima = int(cfg.get("energia_minima", 5))
     energia_alvo = int(cfg.get("energia_alvo", 35))
     max_missoes = int(cfg.get("max_missoes", 0))
@@ -6142,10 +8555,25 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
         try:
             await s.refresh()
 
+            # ⏸️ Pausar 1 conta só (pedido do usuário 2026-07-23) — mesma
+            # ideia da Caçada Solo (ver lá): conteúdo INDEPENDENTE, pausar
+            # esta conta não afeta as outras.
+            if conta_pausada(s.name):
+                if not getattr(s, "_pausa_avisada", False):
+                    log(tag, "⏸️ conta pausada pelo Telegram — esperando ser retomada "
+                             "(as outras contas continuam normalmente).")
+                    s._pausa_avisada = True
+                await asyncio.sleep(5.0)
+                continue
+            if getattr(s, "_pausa_avisada", False):
+                log(tag, "▶️ conta retomada — voltando à Missão Oásis.")
+                s._pausa_avisada = False
+
             if _no_menu_principal(s.message):
                 sem_reconhecer = 0
                 await try_tonico(s)
                 await try_elixir(s)
+                write_status_extra(s.name, chaves_masmorra=keys_count(s.text), vip_ate=vip_ate(s.text))
                 await s.refresh()
                 en = energia_atual(s.text)
                 if en and en[0] < energia_minima:
@@ -6166,6 +8594,33 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
 
             await s.refresh()
             txt = s.text
+
+            # BUG REAL 2026-07-19 (log do usuário: [oasis-trol] preso em
+            # loop em '🌿 Floresta Sombria / A Floresta Profunda está
+            # acessível. Onde deseja caçar?', sempre travado no mesmo
+            # "(1/5)" e sem nunca escapar até virar erro em cascata) —
+            # essa tela é da CAÇADA SOLO (escolha de sub-área dentro da
+            # Floresta Sombria), não tem nada a ver com a Missão Oásis
+            # (que caça no Oásis Perdido) — só aparece aqui se a conta
+            # tinha ficado PARADA nessa tela de uma Caçada Solo anterior
+            # (antes de trocar de modo pra Missão Oásis) e ainda não tinha
+            # sido "limpa". O fallback genérico de 'tela não reconhecida'
+            # não sabia lidar com ela (clicar 'Menu' nessa tela específica
+            # não volta pro menu de verdade) e ficava girando em loop.
+            # Agora: reconhece a tela (reaproveita a mesma checagem de
+            # escolher_submenu_caca_solo), clica em QUALQUER uma das opções
+            # só pra sair dela, e MANDA A CONTA DE VOLTA pro Oásis Perdido
+            # (que é o mapa de verdade da Missão Oásis) em seguida.
+            if "onde deseja cacar" in norm(txt) and find_button(s.message, "floresta sombria"):
+                log(tag, "🔀 tela perdida da Caçada Solo (Floresta Sombria/Profunda) — "
+                         "saindo dela e voltando pro Oásis Perdido.")
+                await escolher_submenu_caca_solo(s)
+                await asyncio.sleep(config.ACTION_DELAY)
+                await viajar_para(s, "Oásis Perdido")
+                await asyncio.sleep(config.ACTION_DELAY)
+                await back_to_menu(s)
+                sem_reconhecer = 0
+                continue
 
             if is_sem_energia_solo(txt):
                 sem_reconhecer = 0
@@ -6257,8 +8712,18 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
                         log(tag, f"🔨 recebeu o Martelo Mágico da Nurmora! (#{total_martelo} no total)")
                     except Exception as e:
                         log(tag, f"(não consegui registrar o Martelo Mágico: {e!r})")
+                    s._martelos_sessao = getattr(s, "_martelos_sessao", 0) + 1
                     await s.click_text("voltar", label="Voltar", required=False)
                     await asyncio.sleep(config.ACTION_DELAY)
+                    # Meta de Martelos atingida (pedido do usuário 2026-07-23)
+                    # — só no modo 'Só Nurmora' (ver leitura de meta_martelos
+                    # acima); no '+ Nurmora' essa meta é ignorada de
+                    # propósito, não interrompe a busca do Sunred.
+                    if meta_martelos and s._martelos_sessao >= meta_martelos:
+                        log(tag, f"🔨 atingiu a meta de {meta_martelos} Martelo(s) Mágico(s) "
+                                 f"nesta sessão — parando.")
+                        registrar_pausa("meta_martelos", f"{s.name}: {s._martelos_sessao}/{meta_martelos}")
+                        return False
                     continue
                 if fazer_nurmora:
                     feita = (await s.click_text("entregar", required=False)
@@ -6462,6 +8927,8 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
             reconheceu = (is_vitoria_solo(txt) or is_armadilha_solo(txt)
                           or is_compra_realizada_solo(txt) or is_mercador_deserto_solo(txt)
                           or is_mercador_viajante_solo(txt) or is_goblin_gibby_solo(txt)
+                          or is_coveiro_huaguilli_solo(txt) or is_bau_tesouro_solo(txt)
+                          or is_estrela_caida_solo(txt)
                           or bool(_botao_caca_de_novo(s)))
             if not reconheceu:
                 sem_reconhecer += 1
@@ -6527,11 +8994,34 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
                                           200, s._missao_kills_alvo, 50)
             elif is_armadilha_solo(txt):
                 log(tag, "⚠️ caí numa armadilha.")
+            elif is_estrela_caida_solo(txt):
+                qtd_poeira = parse_qtd_poeira_estelar(txt)
+                try:
+                    total_poeira = registrar_poeira_estelar(s.name, qtd_poeira)
+                    log(tag, f"🌟 Estrela Caída! Coletou {qtd_poeira}x Poeira Estelar "
+                             f"(#{total_poeira} no total acumulado).")
+                except Exception as e:
+                    log(tag, f"(não consegui registrar a Poeira Estelar: {e!r})")
 
             await tratar_evento_solo(s)
 
             await s.refresh()
             cur, hp_max = parse_hp_voce_solo(s.text, s)
+            # Mesmo reforço da Caçada Solo (ver comentário lá): se a 1ª
+            # leitura falhar bem na hora que a tela ainda pode estar
+            # mudando, tenta mais 1 vez antes de desistir, e loga a tela
+            # crua se ainda assim falhar.
+            if cur is None:
+                await asyncio.sleep(config.ACTION_DELAY)
+                await s.refresh()
+                cur, hp_max = parse_hp_voce_solo(s.text, s)
+                if cur is None and is_tela_sem_hp_solo(s.text):
+                    # Mesmo reforço 2026-07-21 da Caçada Solo (ver comentário
+                    # lá) — tela conhecida sem HP (compra/tesouro), não é erro.
+                    pass
+                elif cur is None:
+                    if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                        log(tag, f"🔍 DEBUG HP não lido após armadilha/evento — texto cru:\n{s.text}")
             ratio = (cur / hp_max) if (cur is not None and hp_max) else None
             # mesma checagem extra por HP real (não %) da Caçada Solo — usa o
             # mesmo valor configurado lá (é o mesmo tipo de armadilha).
@@ -6555,10 +9045,11 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
                 return False
 
             s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
-            if s._contador_perfil % 3 == 0:
+            if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
                 await atualizar_perfil_e_estimativa(s)
             await talvez_vender_no_mercado(s)
             await talvez_ler_inventario(s)
+            await talvez_comprar_pocoes(s)
             # Missão Oásis nunca alimentava o Status ao vivo — corrigido
             # junto (pedido do usuário 2026-07-15: "pra todos os conteúdos").
             _c = player_hp(s.text, s.char)
@@ -6566,7 +9057,16 @@ async def run_missao_oasis_conta(s: Session, baseline: int = 0) -> bool:
                 write_status(s.name, _c[0], _c[1], "Missão Oásis",
                              inicio_ts=getattr(s, "_t_inicio_conteudo", None),
                              nivel=getattr(s, "_nivel", None), xp_faltam=getattr(s, "_xp_faltam", None),
-                             eta_proximo_nivel_seg=getattr(s, "_eta_proximo_nivel_seg", None))
+                             xp_atual=getattr(s, "_xp_atual", None),
+                             eta_proximo_nivel_seg=getattr(s, "_eta_proximo_nivel_seg", None),
+                             atk=getattr(s, "_atk", None), defesa=getattr(s, "_def", None),
+                             crit=getattr(s, "_crit", None),
+                             energia=getattr(s, "_energia_atual", None),
+                             energia_max=getattr(s, "_energia_max", None),
+                             buff_texto=getattr(s, "_buff_texto", None),
+                             monstro_nome=getattr(s, "_ultimo_mob_combate", None),
+                             estoque_pocao_vida=getattr(s, "pocoes_estimadas", None),
+                             xp_pct_nivel=getattr(s, "_xp_pct_nivel", None))
 
             if verificando_fim:
                 # Suspeita de ter completado — volta ao Menu pra ir conferir
@@ -6681,14 +9181,61 @@ async def combat_loop_caca(s: Session, andar_maximo: int, recompensas=None, esta
         return "pocao_baixa"
 
     while True:
+        _t_refresh0 = time.time()
         await s.refresh()
+        _t_refresh = time.time() - _t_refresh0
         txt = s.text
+
+        # "⏹️🚪 Parar e Sair" pedido (painel/Telegram) — na Caçada em Dupla,
+        # avisa o PARCEIRO também (mesmo 'estado' já usado pra morte/poção
+        # baixa) pra sair junto, em vez de deixá-lo sozinho na sala. Na
+        # Caçada Solo ('estado' é None) sai sozinha mesmo — não tem parceiro.
+        if sair_e_parar_pedido():
+            if estado is not None:
+                if not estado.get("sair"):
+                    estado["sair"] = "parar_e_sair"
+                # o check "estado.get('sair')" logo abaixo já cuida de sair
+                # de verdade — evita chamar leave_room() 2x.
+            else:
+                log(s.name, "⏹️🚪 'Parar e Sair' pedido — saindo da caçada.")
+                await leave_room(s)
+                await _capturar_resumo_caca()
+                return "parar_e_sair"
 
         # A DUPLA mandou sair (ex: o parceiro morreu)? Sai NA MESMA HORA.
         if estado is not None and estado.get("sair"):
             log(s.name, f"🚪 saindo junto com a dupla ({estado['sair']}).")
             await leave_room(s)
+            # CORRIGIDO 2026-07-21 (usuário: "parar e sair com 3 duplas,
+            # nenhuma registrou andar/XP/gold/drops corretamente — uma
+            # mostrou andar 49 e não foi"): a conta que "sai junto" (não
+            # a que iniciou o sair) retornava aqui SEM capturar o resumo —
+            # XP/gold/drops/andar só eram capturados pela conta que disparou
+            # o sair (ramo acima). O andar 49 era o fallback de andar_maximo,
+            # acionado quando rec["andar_final"] ficava vazio.
+            await _capturar_resumo_caca()
             return estado["sair"]
+
+        # VISIBILIDADE (pedido do usuário 2026-07-19: "o bot não pegou as
+        # ações do Panda" — log real mostrando ~18s de silêncio total pra
+        # essa conta entre a última rodada resolvida e a morte detectada,
+        # sem NENHUMA linha no meio explicando o motivo): a morte só é
+        # checada aqui, 1x por volta do loop, logo depois de UM 's.refresh()'
+        # — se ESSE refresh específico demorar muito (API do Telegram lenta,
+        # já visto noutras contas: '🐢 get_messages demorou Xs'), a conta
+        # fica literalmente sem ninguém olhando a tela dela até ele voltar,
+        # e SE a morte já tiver acontecido nesse meio tempo, ela só aparece
+        # detectada aqui, de uma vez, sem nada antes explicando o motivo do
+        # silêncio. Isso NÃO significa "o jogo bateu 2x" nem nada estranho
+        # do lado do jogo (o combate continua sendo 1 ataque por rodada) —
+        # é o bot que ficou momentaneamente sem visibilidade da tela dessa
+        # conta. Agora, se esse refresh específico foi incomumente lento E
+        # a conta já aparece morta assim que ele volta, deixa isso EXPLÍCITO
+        # no log em vez de simplesmente "aparecer morta do nada".
+        if _t_refresh > 5.0 and someone_died(txt):
+            log(s.name, f"⚠️ este refresh demorou {_t_refresh:.1f}s (API do Telegram lenta) — "
+                        f"fiquei sem ver a tela desta conta por esse tempo, e ela já "
+                        f"apareceu morta assim que voltou a responder.")
 
         # captura recompensas da caçada (xp/gold/drops) — dedup por hash.
         # BLINDADO: um formato inesperado de recompensa não pode derrubar a
@@ -6706,6 +9253,46 @@ async def combat_loop_caca(s: Session, andar_maximo: int, recompensas=None, esta
 
         andar = parse_andar(txt)
         s._andar_atual = andar   # pro gate "alma a partir do andar N" (use_soul_from_priority)
+
+        # 🐲 Dragão de Cristal de Frost (pedido do usuário 2026-07-23) —
+        # dedup por ANDAR (dentro do 'estado', compartilhado entre as 2
+        # contas da dupla): cada andar só é contado 1 vez. Só conta como
+        # DERROTADO de verdade (não avistado) — confirmado pelo usuário:
+        # se ele aparecer no ÚLTIMO andar programado, a dupla sai sem
+        # matar, então avistamento sozinho não serve pra medir % de drop.
+        #
+        # CORRIGIDO 2026-07-23, 2ª causa (usuário: "matei um monte de
+        # dragão essa madrugada e não marcou" — só 3 derrotas contadas,
+        # bem menos do que de verdade): a versão anterior só considerava a
+        # derrota se o CABEÇALHO ainda mostrasse "Dragão de Cristal de
+        # Frost" na MESMA rodada que a linha "foi derrotado!" aparecesse —
+        # só que em Montanhas Gélidas o andar muda INSTANTANEAMENTE, sem
+        # tela intermediária. Agora: guarda o ANDAR onde o Dragão foi visto
+        # VIVO por último (persistido no 'estado') e usa ESSE andar pra
+        # dedup, independente do que o cabeçalho mostrar quando "foi
+        # derrotado" finalmente aparecer.
+        #
+        # CORRIGIDO 2026-07-23, 3ª causa (print do usuário: "nessa dung
+        # específica ela só mostra os drops no final" — a tela de RESUMO
+        # da caçada ao sair, não um evento ao vivo tipo "Fulano encontrou
+        # X!" como Cripta/Fortaleza têm): a versão anterior tentava ler o
+        # item aqui mesmo, com refreshes extras — MAS esse evento ao vivo
+        # simplesmente NÃO EXISTE nesta dungeon, então nunca ia achar nada.
+        # Agora só CONTA a derrota aqui (dedup por andar); o item dropado é
+        # correlacionado depois, em _registrar_cacada_desta_execucao(), lá
+        # embaixo, onde o RESUMO final de cada conta já foi capturado (ver
+        # parse_resumo_caca) — como só o Dragão dropa esses 6 itens
+        # específicos, qualquer um deles aparecendo no resumo final já
+        # pode ser atribuído a ele com segurança.
+        if estado is not None:
+            nome_mob_atual = parse_nome_mob_dupla(txt)
+            if nome_mob_atual and norm(nome_mob_atual) == norm(DRAGAO_CRISTAL_FROST) and andar is not None:
+                estado["dragao_andar_visto_vivo"] = andar
+            if dragao_cristal_frost_foi_derrotado(txt):
+                andar_dragao = estado.get("dragao_andar_visto_vivo")
+                chave_dedup = andar_dragao if andar_dragao is not None else (andar if andar is not None else "?")
+                vistos_dragao = estado.setdefault("dragao_andares_vistos", set())
+                vistos_dragao.add(chave_dedup)
         # BUG REAL corrigido 2026-07-17 (usuário: "passei do limite de rodadas
         # na caçada" disparando bem antes do andar máximo configurado, mesmo
         # com o combate indo bem — "pensei que já tínhamos corrigido isso"):
@@ -6727,6 +9314,15 @@ async def combat_loop_caca(s: Session, andar_maximo: int, recompensas=None, esta
             rounds = 0
         if andar is not None:
             _ultimo_andar_rounds = andar
+            # CORRIGIDO 2026-07-21 (usuário: "mostrou que foi até o andar 49
+            # e não foi" ao usar Parar e Sair): o andar_final só era gravado
+            # no ramo do andar-limite logo abaixo — qualquer OUTRA saída
+            # (parar e sair, morte, poção baixa) deixava a chave vazia e o
+            # registro caía no fallback de andar_maximo (o 49 configurado).
+            # Agora grava o maior andar VISTO a cada rodada — vale pra
+            # qualquer motivo de saída.
+            if recompensas is not None:
+                recompensas["andar_final"] = max(recompensas.get("andar_final", 0), andar)
         if andar is not None and andar >= andar_maximo:
             log(s.name, f"🏁 cheguei no andar {andar} (limite {andar_maximo}) — saindo da caçada.")
             if recompensas is not None:
@@ -6740,7 +9336,9 @@ async def combat_loop_caca(s: Session, andar_maximo: int, recompensas=None, esta
             return "andar_limite"
 
         if someone_died(txt):
-            log(s.name, "💀 morte detectada na caçada — saindo. O parceiro sai junto.")
+            _linha_morte = linha_morte_detectada(txt)
+            log(s.name, "💀 morte detectada na caçada — saindo. O parceiro sai junto."
+                        + (f" | linha: {_linha_morte!r}" if _linha_morte else ""))
             # DEDUP: as 2 contas da dupla detectam a MESMA morte de forma
             # independente — só registra 1x (a 1ª a chegar aqui, antes de
             # 'estado[sair]' já estar marcado).
@@ -6945,9 +9543,11 @@ async def combat_loop_caca(s: Session, andar_maximo: int, recompensas=None, esta
                 # qualquer caractere, mesmo os que o terminal não desenha,
                 # tipo ⏳ sem fonte) — pra investigar se é algo diferente do
                 # cronômetro normal de 45s da rodada.
-                log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting'. "
-                            f"Linha considerada minha: {ascii(_linha_vista)}\n"
-                            f"🔍 DEBUG: tela inteira: {ascii(s.text)}")
+                if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                    log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting'. "
+                                f"Linha considerada minha: {ascii(_linha_vista)}\n"
+                                f"🔍 DEBUG: tela inteira: {ascii(s.text)}")
+                _registrar_evento("conta_travada", conta=s.name, contexto="Caçada (Solo/Dupla)")
             _t_confirm = time.time() - _t1                         # tempo até resolver a rodada
             log(s.name, f"⏱️ esperei {_espera:.1f}s a vez | agi em {_t_acao:.1f}s | "
                         f"rodada resolveu em {_t_confirm:.1f}s")
@@ -7027,9 +9627,8 @@ async def run_caca_dupla(sessions, baseline=0, continuar=False, grupo_idx=1, ret
     # Verificação de poção ANTES de iniciar — SÓ num início de verdade (não em
     # reinício automático nem numa RETOMADA manual, pra não travar/atrapalhar):
     # conta as Poções de Vida; se < aviso (padrão 100), pop-up pedindo
-    # reabastecer e para.
-    # EM PARALELO (as 2 contas leem o Inventário ao mesmo tempo) — antes era
-    # uma de cada vez e isso sozinho já levava ~15s.
+    # reabastecer e para. EM PARALELO (as 2 contas leem o Inventário ao mesmo
+    # tempo) — antes era uma de cada vez e isso sozinho já levava ~15s.
     # BUG REAL corrigido 2026-07-16 (usuário: retomada detectada certinho,
     # mas as 4 contas saíram do combate mesmo assim e criaram sala nova): essa
     # checagem só pulava com 'continuar' (reinício automático) — não com
@@ -7037,7 +9636,17 @@ async def run_caca_dupla(sessions, baseline=0, continuar=False, grupo_idx=1, ret
     # chama back_to_menu() por dentro, que sem 'Menu'/'Viajar' disponíveis
     # durante o combate cai num /start de última instância, tirando a conta
     # da tela de combate ANTES do combat_loop_caca sequer começar.
-    if not continuar and not retomar:
+    #
+    # CORRIGIDO 2026-07-23 (usuário: "entre uma caçada dupla e outra, ele
+    # verifica a quantidade de pot?" — resposta na hora: não, só verificava
+    # 1x, bem no início da run inteira, nunca mais de novo entre as caçadas
+    # seguintes da MESMA sessão) — virou uma função, chamada TAMBÉM no topo
+    # de cada volta do loop abaixo (pedido do usuário: "bote em todos os
+    # conteúdos, já que dá pra ativar e desativar quando quiser" — a compra
+    # automática só faz sentido de verdade se checar toda vez, não só na
+    # primeira caçada).
+    async def _checar_pocao_antes_de_comecar():
+        """True = pode seguir; False = pausou (quem chama deve 'return False')."""
         async def _checar_aviso(s):
             qtd = await contar_pocoes_vida(s)
             if qtd is not None:
@@ -7050,19 +9659,29 @@ async def run_caca_dupla(sessions, baseline=0, continuar=False, grupo_idx=1, ret
             # corrigido 2026-07-03), só segue (vai tentar de novo, se precisar,
             # na próxima checagem em combate).
             if qtd is not None and qtd < pocao_aviso:
+                qtd = await tentar_comprar_pocao_automatico(s, qtd)
+                if qtd >= pocao_aviso:
+                    continue   # comprou o suficiente — segue sem pausar
                 await asyncio.to_thread(
                     popup_aviso, "TofuBot — Caçada em Dupla",
                     f"Poção de Vida inferior a {pocao_aviso}!\n\n"
                     f"Conta {s.name}: {qtd} poções.\n\nFavor reabastecer.")
-                log(s.name, f"⏹ pausado antes de iniciar: {qtd} Poções de Vida "
+                log(s.name, f"⏹ pausado: {qtd} Poções de Vida "
                             f"(< {pocao_aviso}). Reabasteça e clique Iniciar de novo.")
                 registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd} (< {pocao_aviso})")
                 return False
+        return True
 
     esta_volta_retoma = retomar
+    pular_checagem_pocao = continuar or retomar   # só vale pra ESTA entrada específica
     while True:
         try:
-            estado_dupla = {"sair": None}    # compartilhado: morte de um -> outro sai
+            if not pular_checagem_pocao:
+                if not await _checar_pocao_antes_de_comecar():
+                    return False
+            pular_checagem_pocao = False   # da 2ª caçada em diante, sempre checa
+            estado_dupla = {"sair": None, "grupo_idx": grupo_idx, "dragao_andares_vistos": set(),
+                            "sessions_ref": sessions}    # compartilhado: morte de um -> outro sai
             for s in sessions:
                 s.sair_caca_pocao = False    # zera a cada nova caçada
 
@@ -7166,6 +9785,32 @@ async def run_caca_dupla(sessions, baseline=0, continuar=False, grupo_idx=1, ret
                 log(tag, f"🏁 caçada #{total} registrada "
                          f"({feitas_local} desta dupla desde que iniciou).")
 
+                # 🐲 Dragão de Cristal de Frost (pedido do usuário 2026-07-23,
+                # 3ª correção) — CORRELACIONA aqui, no fechamento da execução,
+                # em vez de tentar pegar o item na hora da morte (print do
+                # usuário confirmou: "nessa dung específica ela só mostra os
+                # drops no final", não tem evento ao vivo tipo "encontrou X!").
+                # Combina os drops de TODAS as contas desta execução (drops
+                # são individuais por conta, mas o que importa aqui é o TOTAL
+                # da dupla) e procura os 6 itens EXCLUSIVOS do Dragão — como
+                # nenhum outro mob dropa esses itens, qualquer um encontrado
+                # aqui pode ser atribuído a ele com segurança. Registra 1x
+                # por derrota confirmada nesta execução (ver dedup por andar
+                # em combat_loop_caca); derrotas sem item correspondente
+                # sobrando registram sem drop.
+                derrotas_dragao = len(estado_dupla.get("dragao_andares_vistos") or set())
+                if derrotas_dragao > 0:
+                    todos_drops = []
+                    for r in resumo_por_conta.values():
+                        todos_drops.extend(r.get("drops") or [])
+                    itens_dragao_achados = [item for item in todos_drops if item in ITENS_DRAGAO_CRISTAL_FROST]
+                    for i in range(derrotas_dragao):
+                        item = itens_dragao_achados[i] if i < len(itens_dragao_achados) else None
+                        try:
+                            registrar_dragao_derrotado(item, grupo_idx=grupo_idx)
+                        except Exception as e:
+                            log(tag, f"(não consegui registrar a derrota do Dragão: {e!r})")
+
             # MORTE: alguém morreu -> as 2 já saíram (estado compartilhado). Para.
             if "morte" in motivos:
                 log(tag, "⏹ pausando esta Caçada em Dupla (alguém morreu — a dupla "
@@ -7183,6 +9828,15 @@ async def run_caca_dupla(sessions, baseline=0, continuar=False, grupo_idx=1, ret
                     f"As Poções de Vida acabaram (ou ficaram abaixo do mínimo "
                     f"configurado) DURANTE a caçada!\n\n"
                     f"A dupla já saiu da sala. Reabasteça e clique Iniciar de novo.")
+                return False
+
+            # "⏹️🚪 Parar e Sair" atendido: a dupla já saiu da sala (ver
+            # combat_loop_caca) — registra o progresso e para de vez, igual
+            # morte/poção baixa (não tenta formar sala nova).
+            if "parar_e_sair" in motivos:
+                log(tag, "⏹️🚪 'Parar e Sair' atendido — a dupla saiu da sala. Parando.")
+                _registrar_cacada_desta_execucao()
+                registrar_pausa("parar_e_sair", f"dupla{grupo_idx}: pedido pelo usuário")
                 return False
 
             # caçada concluída (chegou no andar máximo): registra e conta.
@@ -7205,17 +9859,18 @@ async def run_caca_dupla(sessions, baseline=0, continuar=False, grupo_idx=1, ret
             # com 2 duplas rodando em paralelo, se cada uma limpasse ao terminar,
             # a 1ª a acabar apagaria o pedido antes da 2ª notar. Quem limpa de
             # vez é o main(), uma única vez, no próximo "Iniciar".
-            if parar_no_fim_pedido():
-                log(tag, "⏸ 'Parar no fim' atendido — esta dupla concluiu a "
-                         "caçada atual, parando.")
+            if parar_no_fim_pedido() or algum_membro_pausado(sessions):
+                log(tag, "⏸ 'Parar no fim' atendido (ou um membro pausado) — esta dupla "
+                         "concluiu a caçada atual, parando.")
                 registrar_pausa("parar_no_fim", f"dupla{grupo_idx}: após concluir a caçada atual")
                 return False
 
             s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
-            if s._contador_perfil % 3 == 0:
+            if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
                 await atualizar_perfil_e_estimativa(s)
             await talvez_vender_no_mercado(s)
             await talvez_ler_inventario(s)
+            await talvez_comprar_pocoes(s)
 
             # Manutenção agendada chegando perto: se o tempo até ela começar
             # for menor que a média de duração desta caçada, não forma uma
@@ -7275,8 +9930,10 @@ async def run_templo_oasis_dupla(sessions, baseline=0, continuar=False, grupo_id
     # reinício automático nem numa retomada manual), mesmo padrão da Caçada em
     # Dupla (mesmo bug real corrigido lá: contar_pocoes_vida chama
     # back_to_menu() por dentro, o que tira a conta do combate se já estiver
-    # ativo).
-    if not continuar and not retomar:
+    # ativo). CORRIGIDO 2026-07-23 (mesma correção da Caçada em Dupla — ver
+    # lá): virou função, chamada também no topo de CADA volta do loop, não só
+    # na primeira execução da sessão.
+    async def _checar_pocao_antes_de_comecar():
         async def _checar_aviso(s):
             qtd = await contar_pocoes_vida(s)
             log(s.name, f"🧪 Poções de Vida no estoque: {qtd if qtd is not None else 'não confirmado'}.")
@@ -7284,18 +9941,27 @@ async def run_templo_oasis_dupla(sessions, baseline=0, continuar=False, grupo_id
         resultados = await asyncio.gather(*(_checar_aviso(s) for s in sessions))
         for s, qtd in resultados:
             if qtd is not None and qtd < pocao_aviso:
+                qtd = await tentar_comprar_pocao_automatico(s, qtd)
+                if qtd >= pocao_aviso:
+                    continue
                 await asyncio.to_thread(
                     popup_aviso, "TofuBot — Templo do Oásis",
                     f"Poção de Vida inferior a {pocao_aviso}!\n\n"
                     f"Conta {s.name}: {qtd} poções.\n\nFavor reabastecer.")
-                log(s.name, f"⏹ pausado antes de iniciar: {qtd} Poções de Vida "
+                log(s.name, f"⏹ pausado: {qtd} Poções de Vida "
                             f"(< {pocao_aviso}). Reabasteça e clique Iniciar de novo.")
                 registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd} (< {pocao_aviso})")
                 return False
+        return True
 
     esta_volta_retoma = retomar
+    pular_checagem_pocao = continuar or retomar
     while True:
         try:
+            if not pular_checagem_pocao:
+                if not await _checar_pocao_antes_de_comecar():
+                    return False
+            pular_checagem_pocao = False
             shared = {
                 "leave_event": asyncio.Event(),
                 "restart": asyncio.Event(),
@@ -7319,6 +9985,23 @@ async def run_templo_oasis_dupla(sessions, baseline=0, continuar=False, grupo_id
                 await asyncio.gather(*(limpar_historico(s) for s in sessions))
                 # cura quem ficou baixo antes de formar sala nova
                 await asyncio.gather(*(heal_at_menu_if_low(s) for s in sessions))
+
+                # PRIORIDADE DE HOST por quem tem mais Chave de Masmorra — mesmo
+                # critério que a Masmorra normal já usa (ver run_masmorra ->
+                # max(shared["keys"], ...)). BUG REAL reportado pelo usuário
+                # 2026-07-25: aqui 'host, joiner = sessions' (linha do topo desta
+                # função) ficava FIXO na ordem configurada, sem olhar quem tinha
+                # mais chave — diferente da Masmorra normal, que sempre escolhe
+                # quem tem mais. Confirmado que o Templo do Oásis consome a MESMA
+                # Chave de Masmorra comum (não uma chave especial de inventário
+                # tipo a do Ossuário), então a leitura é a mesma (read_keys_at_menu).
+                # Em empate, mantém a ordem configurada (sessions[0] continua host).
+                chaves = dict(zip((s.name for s in sessions),
+                                  await asyncio.gather(*(read_keys_at_menu(s) for s in sessions))))
+                if chaves.get(joiner.name, 0) > chaves.get(host.name, 0):
+                    host, joiner = joiner, host
+                log(tag, f"👑 host desta execução: {host.name} ({chaves.get(host.name, 0)} chaves, "
+                         f"vs {chaves.get(joiner.name, 0)} de {joiner.name}).")
 
                 host_char = await host_criar_templo(host)
                 if not host_char:
@@ -7429,18 +10112,19 @@ async def run_templo_oasis_dupla(sessions, baseline=0, continuar=False, grupo_id
                          f"execuç(ões) do Templo do Oásis desde o início — parando.")
                 registrar_pausa("limite_templo_oasis", f"dupla{grupo_idx}: {feitas_local}/{max_execucoes}")
                 return False
-            if parar_no_fim_pedido():
-                log(tag, "⏸ 'Parar no fim' atendido — esta dupla concluiu o Templo do Oásis "
-                         "atual, parando.")
+            if parar_no_fim_pedido() or algum_membro_pausado(sessions):
+                log(tag, "⏸ 'Parar no fim' atendido (ou um membro pausado) — esta dupla "
+                         "concluiu o Templo do Oásis atual, parando.")
                 registrar_pausa("parar_no_fim", f"dupla{grupo_idx}: após concluir o Templo do Oásis atual")
                 return False
 
             async def _talvez_atualizar_perfil(s):
                 s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
-                if s._contador_perfil % 3 == 0:
+                if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
                     await atualizar_perfil_e_estimativa(s)
                 await talvez_vender_no_mercado(s)
                 await talvez_ler_inventario(s)
+                await talvez_comprar_pocoes(s)
             await asyncio.gather(*(_talvez_atualizar_perfil(s) for s in sessions))
 
             await evitar_novo_conteudo_por_manutencao("templo_oasis", rotulo="Templo do Oásis")
@@ -7455,6 +10139,162 @@ def _cripta_btn_subs(nivel: str):
     'cripta ii ('/'cripta iii (', evitando pegar o nível errado)."""
     n = {"I": "i", "II": "ii", "III": "iii"}.get((nivel or "I").upper(), "i")
     return (f"cripta {n} (",)
+
+
+async def garantir_skin_fortaleza(s: Session) -> bool:
+    """Garante que a conta está com QUALQUER UMA das skins ACEITAS
+    (config.FORTALEZA_ORCS_SKINS — lista fixa no código de propósito, não é
+    campo editável no painel: pedido do usuário 2026-07-20, 'deixar essa
+    opção de digitar o nome abre mt brecha para bugs' — mesmo padrão de
+    MASMORRAS_ALTERNATIVAS) equipada antes de tentar entrar na Fortaleza dos
+    Orcs — se não tiver NENHUMA das aceitas equipada, equipa a primeira que
+    a conta possuir. Caminho: Menu -> Inventário -> Skins (confirmado por
+    print do usuário — o botão já equipado mostra 'Desequipar <skin>'; se
+    não, 'Equipar <skin>'). Lista é PAGINADA (➡️) — procura em todas as
+    páginas antes de desistir. Retorna True se confirmou (ou já estava)
+    equipada, False se não conseguiu confirmar a tempo."""
+    skins_aceitas = [norm(sk) for sk in (getattr(config, "FORTALEZA_ORCS_SKINS", None) or []) if sk]
+    if not skins_aceitas:
+        return True
+    rotulo_skins = " / ".join(getattr(config, "FORTALEZA_ORCS_SKINS", []))
+    await back_to_menu(s)
+    for _ in range(20):
+        await s.refresh()
+        if any(find_button(s.message, f"desequipar {sk}") for sk in skins_aceitas):
+            await back_to_menu(s)
+            return True
+        b_equipar = next((b for sk in skins_aceitas
+                          for b in [find_button(s.message, f"equipar {sk}")]
+                          if b and "desequipar" not in norm(b.text)), None)
+        if b_equipar:
+            log(s.name, f"👕 equipando '{b_equipar.text}' (skin exigida pra Fortaleza dos Orcs).")
+            await s.click(b_equipar, label=b_equipar.text)
+            continue
+        # BUG REAL 2026-07-20 (usuário: "há uma seta pra direita, tenho
+        # muitas skins e essa em específico está em outra aba") — a lista
+        # de Skins é PAGINADA; antes só olhava a página atual e desistia
+        # achando que a conta não tinha a skin, quando na verdade ela só
+        # estava numa página seguinte. Agora, se a tela atual já tiver
+        # QUALQUER botão de Equipar/Desequipar (ou seja, já estamos na
+        # lista de Skins) e o alvo não estiver nela, tenta avançar com
+        # '➡️' antes de desistir.
+        _na_tela_skins = any("equipar" in norm(b.text) for b in iter_buttons(s.message))
+        if _na_tela_skins:
+            b_prox = find_button(s.message, "➡️", "➡")
+            if b_prox:
+                await s.click(b_prox, label="➡️ (próxima página de Skins)")
+                continue
+        b_skins = find_button(s.message, "skins")
+        if b_skins:
+            await s.click(b_skins, label="Skins")
+            continue
+        b_inv = find_button(s.message, "inventario", "inventário")
+        if b_inv:
+            await s.click(b_inv, label="Inventário")
+            continue
+        b_menu = find_button(s.message, "menu")
+        if b_menu:
+            await s.click(b_menu, label="Menu")
+            continue
+        if await _tentar_evitar_start(s):
+            continue
+        await s.send_start()
+    log(s.name, f"⚠️ não consegui confirmar/equipar nenhuma das skins aceitas ({rotulo_skins}) "
+                f"pra Fortaleza dos Orcs. botões: {button_texts(s.message)}")
+    return False
+
+
+async def open_fortaleza_orcs(s: Session):
+    """Chega na tela 'Masmorras da Fortaleza dos Orcs' (com os botões
+    Fosso de Provas / Trono de Khar'gath, confirmado por print do usuário).
+    Caminho: Menu -> Masmorra (a conta já foi levada ao mapa Fortaleza dos
+    Orcs antes, em main())."""
+    for _ in range(8):
+        await s.refresh()
+        if find_button(s.message, "fosso de provas", "trono de khar"):
+            return True
+        if is_combat_screen(s.message) or find_button(s.message, "sair"):
+            await leave_room(s)
+            continue
+        mf = find_button(s.message, "masmorras da fortaleza")
+        if mf:
+            await s.click(mf, label="Masmorras da Fortaleza dos Orcs")
+            continue
+        mm = find_button(s.message, "masmorra")
+        if mm:
+            await s.click(mm, label="Masmorra")
+            continue
+        mb = find_button(s.message, "menu")
+        if mb:
+            await s.click(mb, label="Menu")
+            continue
+        if await _tentar_evitar_start(s):
+            continue
+        await s.send_start()
+    return find_button(s.message, "fosso de provas", "trono de khar") is not None
+
+
+async def host_criar_fortaleza(s: Session, tipo: str):
+    """HOST: abre a Fortaleza dos Orcs, escolhe a masmorra (Fosso de Provas
+    ou Trono de Khar'gath) — cria a sala SEM senha — e devolve o código lido
+    do lobby."""
+    if not await garantir_skin_fortaleza(s):
+        return None
+    if not await open_fortaleza_orcs(s):
+        log(s.name, "❌ não cheguei na tela das Masmorras da Fortaleza dos Orcs (host).")
+        return None
+    botao_tipo = FORTALEZA_TIPO_BOTAO.get(tipo, tipo)
+    if not await s.click_text(botao_tipo, label=botao_tipo):
+        return None
+    await s.refresh()
+    code = find_fortaleza_code(s.text)
+    if code:
+        log(s.name, f"✅ {botao_tipo} criada. Código: {code}")
+    else:
+        log(s.name, f"⚠️ criei a {botao_tipo} mas não achei o código.\n    texto: {s.text}")
+    return code
+
+
+async def joiner_entrar_fortaleza(s: Session, code: str):
+    """CONTA COMUM: garante a skin, depois entra na sala da Fortaleza dos
+    Orcs pela lista de 'Salas da Fortaleza' + código (SEM senha)."""
+    if not await garantir_skin_fortaleza(s):
+        return False
+    if not await open_fortaleza_orcs(s):
+        log(s.name, "❌ não cheguei na tela das Masmorras da Fortaleza dos Orcs (join).")
+        return False
+    if not await s.click_text("salas da fortaleza", label="Salas da Fortaleza"):
+        return False
+    for _ in range(10):
+        alvo = find_button(s.message, code)
+        if alvo:
+            await s.click(alvo, label=f"sala {code}")
+            log(s.name, "✅ entrei na Fortaleza dos Orcs.")
+            return True
+        prox = find_button(s.message, "proximo", "próximo")
+        if prox:
+            await s.click(prox, label="Próximo")
+        else:
+            log(s.name, f"❌ não achei a sala {code} na lista.\n"
+                        f"    botões: {button_texts(s.message)}")
+            return False
+    return False
+
+
+async def host_iniciar_fortaleza(s: Session) -> bool:
+    """HOST: com todos prontos, clica '🚀 Iniciar' pra começar a Fortaleza
+    dos Orcs."""
+    for _ in range(int(config.LOBBY_TIMEOUT / config.POLL_INTERVAL)):
+        await s.refresh()
+        if is_combat_screen(s.message):
+            return True
+        b = find_button(s.message, "iniciar")
+        if b:
+            await s.click(b, label="Iniciar")
+            return True
+        await poll_sleep()
+    log(s.name, "⚠️ não achei o botão 'Iniciar' no lobby da Fortaleza dos Orcs.")
+    return False
 
 
 async def open_cripta(s: Session):
@@ -7577,7 +10417,15 @@ async def combat_loop_cripta(s: Session, andar_maximo: int, estado: dict,
         um refresh novo — pior ainda com a API do Telegram lenta — podia
         chegar tarde demais e perder a janela de captura. Agora CHECA o
         texto atual primeiro, só refresca se ainda não bateu, e avisa no
-        log se mesmo assim não conseguir (pra não ficar silencioso)."""
+        log se mesmo assim não conseguir (pra não ficar silencioso).
+        ATUALIZADO 2026-07-21: leave_room() agora já tenta capturar esse
+        texto sozinho, assim que aparece, durante as próprias tentativas de
+        sair (mesmo se não conseguir confirmar a saída) — se isso já
+        funcionou, s._saida_txt já teria o texto certo, então nem precisa
+        tentar de novo nem avisar aviso nenhum aqui."""
+        _saida_ja_capturada = getattr(s, "_saida_txt", None)
+        if _saida_ja_capturada and "progresso acumulado" in norm(_saida_ja_capturada):
+            return
         for i in range(8):
             if "progresso acumulado" in norm(s.text):
                 s._saida_txt = s.text
@@ -7613,6 +10461,9 @@ async def combat_loop_cripta(s: Session, andar_maximo: int, estado: dict,
     while True:
         await s.refresh()
         txt = s.text
+
+        if sair_e_parar_pedido() and estado is not None and not estado.get("sair"):
+            estado["sair"] = "parar_e_sair"
 
         if estado is not None and estado.get("sair"):
             log(s.name, f"🚪 saindo junto com o grupo ({estado['sair']}).")
@@ -7684,7 +10535,9 @@ async def combat_loop_cripta(s: Session, andar_maximo: int, estado: dict,
             return "andar_limite"
 
         if someone_died(txt, nomes_grupo):
-            log(s.name, "💀 morte detectada — saindo. O grupo sai junto.")
+            _linha_morte = linha_morte_detectada(txt, nomes_grupo)
+            log(s.name, "💀 morte detectada — saindo. O grupo sai junto."
+                        + (f" | linha: {_linha_morte!r}" if _linha_morte else ""))
             ja_registrada = estado is not None and estado.get("sair") == "morte"
             if estado is not None:
                 estado["sair"] = "morte"
@@ -7836,8 +10689,10 @@ async def combat_loop_cripta(s: Session, andar_maximo: int, estado: dict,
                     continue
                 await poll_sleep()
             if not _mudou:
-                log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting' "
-                            f"na cripta. tela inteira: {ascii(s.text)}")
+                if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                    log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting' "
+                                f"na cripta. tela inteira: {ascii(s.text)}")
+                _registrar_evento("conta_travada", conta=s.name, contexto="Cripta")
             _t_confirm = time.time() - _t1
             log(s.name, f"⏱️ esperei {_espera:.1f}s a vez | agi em {_t_acao:.1f}s | "
                         f"rodada resolveu em {_t_confirm:.1f}s")
@@ -7852,6 +10707,270 @@ async def combat_loop_cripta(s: Session, andar_maximo: int, estado: dict,
                 rounds_almas += 1
                 await brain.act(rounds_almas)
                 _motivo_pocao = await _sair_pocao_agora()   # item 2: aborta JÁ
+                if _motivo_pocao:
+                    return _motivo_pocao
+                continue
+
+        await poll_sleep()
+
+
+async def combat_loop_fortaleza(s: Session, estado: dict, nomes_grupo: list,
+                                 tank_por_ultimo: bool = True):
+    """Combate da FORTALEZA DOS ORCS: mesmo motor da Cripta (grupo de 1 a 5,
+    layout 'Nv.' + ampulheta ⏳, monstro com 'ID:'+'HP:' na mesma linha —
+    confirmado por print do usuário), mas o fim NÃO é por andar-limite —
+    é quando aparece a tela final '... — COMPLETA!' (a Fortaleza é SEMPRE 3
+    salas + 1 sala de BOSS, avançando sozinha de uma pra outra sem tela de
+    transição própria — confirmado por print: a recompensa de cada sala
+    aparece como um EVENTO dentro da PRÓPRIA tela de combate da sala
+    seguinte, não uma tela à parte). 'estado' é um dict COMPARTILHADO entre
+    todas as contas do grupo. Retorna o MOTIVO da saída: "completo" |
+    "morte" | "pocao_baixa" | "travou" | "tela" | "rodadas"."""
+    brain = Brain(s)
+    if getattr(s, "_retomando_conteudo", False):
+        s._retomando_conteudo = False
+        brain.rodadas_desde_resync_alma = RESYNC_ALMA_RODADAS
+    rounds = 0
+    rounds_almas = 0
+    sem_linha = 0
+    _ultima_limpeza_rounds = 0
+
+    async def _sair_pocao_agora():
+        if not s.sair_caca_pocao:
+            return None
+        log(s.name, "🧪 saindo da Fortaleza dos Orcs (Poções de Vida abaixo do limite).")
+        if estado is not None:
+            estado["sair"] = "pocao"
+        s._saida_txt = s.text
+        await leave_room(s)
+        return "pocao_baixa"
+
+    async def _capturar_resultados_fortaleza():
+        """BUG REAL corrigido 2026-07-20 (achado em revisão própria, antes de
+        qualquer teste): quando UMA conta via a tela 'COMPLETA' primeiro, ela
+        marcava estado['sair']='completo' e todas as OUTRAS contas saíam
+        pelo atalho compartilhado (linha logo abaixo) SEM NUNCA terem visto
+        a própria tela de Resultados — ficavam com s._saida_txt vazio/velho,
+        e o registro final contava 0 XP/0 Gold pra elas. Agora, antes de
+        aceitar a saída compartilhada, cada conta tenta ver a PRÓPRIA tela
+        'COMPLETA' por alguns instantes (é a MESMA tela pra todo mundo, só
+        pode demorar 1-2 refreshes a mais pra chegar em cada uma)."""
+        for _ in range(6):
+            if is_fortaleza_completa(s.text):
+                s._saida_txt = s.text
+                return
+            await poll_sleep()
+            await s.refresh()
+        if not getattr(s, "_saida_txt", None):
+            log(s.name, "⚠️ não vi minha própria tela 'COMPLETA' antes de sair — "
+                        "XP/Gold desta Fortaleza dos Orcs podem não entrar no relatório.")
+
+    while True:
+        await s.refresh()
+        txt = s.text
+
+        if sair_e_parar_pedido() and estado is not None and not estado.get("sair"):
+            estado["sair"] = "parar_e_sair"
+
+        if estado is not None and estado.get("sair"):
+            if estado["sair"] == "completo":
+                await _capturar_resultados_fortaleza()
+            else:
+                log(s.name, f"🚪 saindo junto com o grupo ({estado['sair']}).")
+                await leave_room(s)
+            return estado["sair"]
+
+        _motivo_pocao = await _sair_pocao_agora()
+        if _motivo_pocao:
+            return _motivo_pocao
+
+        sala_txt = progresso_atual_texto(txt)
+        if sala_txt:
+            s._andar_atual = sala_txt
+
+        if estado is not None:
+            vistos = estado.setdefault("drops_vistos", set())
+            for nome_evento, item in parse_drops_evento_cripta(txt):
+                chave = f"{sala_txt}|{nome_evento}|{item}"
+                if chave in vistos:
+                    continue
+                if norm(s.char) in norm(nome_evento):
+                    vistos.add(chave)
+                    estado.setdefault("drops_por_conta", {}).setdefault(s.name, []).append(item)
+            # REFORÇO (pedido do usuário 2026-07-22: "dropei uma alma... e
+            # não apareceu na lista... elas são dropadas geralmente entre
+            # salas") — a lista "Eventos:" só mostra os ~4-5 mais recentes;
+            # bem na transição de sala (mob derrotado + alma dropada +
+            # próximo mob já atacando) dá pra perder a linha da alma antes
+            # do próximo poll normal capturar aquela tela. Quando vê "foi
+            # derrotado" (mob morreu — a hora mais provável de vir alma
+            # junto), faz 1 refresh extra imediato só pra tentar pegar a
+            # linha antes que role pra fora da lista. Custo baixo (só nas
+            # transições de sala, ~3-4x por Fortaleza, não toda rodada).
+            if "foi derrotado" in norm(txt):
+                await asyncio.sleep(0.6)
+                await s.refresh()
+                txt_extra = s.text
+                for nome_evento, item in parse_drops_evento_cripta(txt_extra):
+                    chave = f"{sala_txt}|{nome_evento}|{item}"
+                    if chave in vistos:
+                        continue
+                    if norm(s.char) in norm(nome_evento):
+                        vistos.add(chave)
+                        estado.setdefault("drops_por_conta", {}).setdefault(s.name, []).append(item)
+                        log(s.name, f"🎁 alma capturada no refresh extra da transição: {item}")
+                txt = txt_extra   # segue com a leitura mais fresca pro resto do loop
+
+        if is_fortaleza_completa(txt):
+            s._saida_txt = txt
+            if estado is not None and estado.get("sair") != "completo":
+                estado["sair"] = "completo"
+            log(s.name, "🏆 Fortaleza dos Orcs completa!")
+            return "completo"
+
+        if someone_died(txt, nomes_grupo):
+            _linha_morte = linha_morte_detectada(txt, nomes_grupo)
+            log(s.name, "💀 morte detectada — saindo. O grupo sai junto."
+                        + (f" | linha: {_linha_morte!r}" if _linha_morte else ""))
+            ja_registrada = estado is not None and estado.get("sair") == "morte"
+            if estado is not None:
+                estado["sair"] = "morte"
+            if not ja_registrada:
+                try:
+                    registrar_morte("fortaleza_orcs")
+                except Exception as e:
+                    log(s.name, f"(não consegui registrar a morte: {e!r})")
+            s._saida_txt = txt
+            await leave_room(s)
+            return "morte"
+
+        if estado is not None and rounds >= 3:
+            travada = conta_travada_no_combate(estado, s.name)
+            if travada:
+                nome_t, papel_t = travada
+                log(s.name, f"⚠️ '{nome_t}' ({papel_t}) travou na Fortaleza dos Orcs "
+                            f"(flood/rede/reinício?) — saindo pra não morrer.")
+                estado["sair"] = "travou"
+                await leave_room(s)
+                return "travou"
+
+        if not is_combat_screen(s.message):
+            if find_button(s.message, "proximo", "próximo", "continuar", "avancar", "avançar"):
+                log(s.name, "➡️ avançando de sala.")
+                await s.click_text("proximo", "próximo", "continuar",
+                                   "avancar", "avançar", label="Próximo", required=False)
+                rounds = 0
+                continue
+            if is_lobby_screen(s.message):
+                await poll_sleep()
+                continue
+            _botoes_tela = button_texts(s.message)
+            eh_notificacao_transitoria = (
+                bool(re.search(r"expirou por inatividade", norm(txt)))
+                or (len(_botoes_tela) == 1 and find_button(s.message, "menu") is not None))
+            tentativas_voltar = 12 if eh_notificacao_transitoria else 6
+            voltou = False
+            for _ in range(tentativas_voltar):
+                hp_emergencia = player_hp(s.text, s.char)
+                if hp_emergencia and hp_emergencia[1]:
+                    ratio_emerg = hp_emergencia[0] / hp_emergencia[1]
+                    limite_emerg = getattr(s, "caca_vida_ratio", 0.4) or 0.4
+                    if ratio_emerg <= limite_emerg:
+                        log(s.name, f"🩺 emergência enquanto espera a tela real voltar: "
+                                    f"HP em {ratio_emerg:.0%} — bebendo poção por segurança.")
+                        await act_potion(s)
+                if find_button(s.message, "voltar", "atras", "⬅", "◀", "🔙"):
+                    await go_back(s)
+                await s.refresh()
+                if is_combat_screen(s.message) or find_button(
+                        s.message, "proximo", "próximo", "continuar", "avancar", "avançar"):
+                    voltou = True
+                    break
+                await poll_sleep()
+            if voltou:
+                continue
+            hp_emergencia = player_hp(s.text, s.char)
+            if hp_emergencia and hp_emergencia[1]:
+                ratio_emerg = hp_emergencia[0] / hp_emergencia[1]
+                if ratio_emerg <= 0.4:
+                    log(s.name, f"🩺 emergência antes de desistir da tela: HP em "
+                                f"{ratio_emerg:.0%} — tentando beber poção por segurança.")
+                    await act_potion(s)
+            log(s.name, "🏁 saí da tela de combate (Fortaleza dos Orcs). Texto:\n"
+                        f"    {txt}\n    botões: {button_texts(s.message)}")
+            s._saida_txt = txt
+            return "tela"
+
+        turno = my_turn_state(txt, s.char)
+        if turno == "waiting":
+            sem_linha = 0
+            rounds += 1
+            rounds_almas += 1
+            if rounds > config.MAX_ROUNDS:
+                log(s.name, "⚠️ passei do limite de rodadas na Fortaleza dos Orcs. Saindo.")
+                await leave_room(s)
+                return "rodadas"
+            if rounds_almas - _ultima_limpeza_rounds >= 20:
+                _ultima_limpeza_rounds = rounds_almas
+                await limpar_historico(s)
+                await s.refresh()
+                txt = s.text
+            _agora = time.time()
+            _espera = _agora - getattr(s, "_t_fim_ciclo", _agora)
+            _t0 = time.time()
+            await brain.act(rounds_almas)
+            _motivo_pocao = await _sair_pocao_agora()
+            if _motivo_pocao:
+                return _motivo_pocao
+            _t_acao = time.time() - _t0
+            _t1 = time.time()
+            _deadline = _t1 + config.ROUND_TIMEOUT_CACA
+            _texto_antes = s.text
+            _mudou = False
+            _tentativas_retry = 0
+            _ultima_tentativa = _t1
+            while time.time() < _deadline:
+                await s.refresh()
+                if is_combat_screen(s.message) and my_turn_state(s.text, s.char) != "waiting":
+                    _mudou = True
+                    break
+                if s.text != _texto_antes:
+                    _mudou = True
+                    break
+                if (time.time() - _ultima_tentativa >= config.RETRY_ACAO_APOS_CACA
+                        and _tentativas_retry < config.MAX_TENTATIVAS_ACAO):
+                    _tentativas_retry += 1
+                    log(s.name, f"🔁 sem nenhuma mudança em {config.RETRY_ACAO_APOS_CACA:.0f}s "
+                                f"na Fortaleza dos Orcs — o clique pode ter falhado, tentando agir "
+                                f"de novo (tentativa {_tentativas_retry}/{config.MAX_TENTATIVAS_ACAO}).")
+                    await brain.act(rounds_almas)
+                    _motivo_pocao = await _sair_pocao_agora()
+                    if _motivo_pocao:
+                        return _motivo_pocao
+                    _texto_antes = s.text
+                    _ultima_tentativa = time.time()
+                    continue
+                await poll_sleep()
+            if not _mudou:
+                if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                    log(s.name, f"🔍 DEBUG: {config.ROUND_TIMEOUT_CACA:.0f}s e ainda via 'waiting' "
+                                f"na Fortaleza dos Orcs. tela inteira: {ascii(s.text)}")
+                _registrar_evento("conta_travada", conta=s.name, contexto="Fortaleza dos Orcs")
+            _t_confirm = time.time() - _t1
+            log(s.name, f"⏱️ esperei {_espera:.1f}s a vez | agi em {_t_acao:.1f}s | "
+                        f"rodada resolveu em {_t_confirm:.1f}s")
+            s._t_fim_ciclo = time.time()
+            continue
+        if turno == "unknown":
+            sem_linha += 1
+            if sem_linha >= 10:
+                log(s.name, f"⚠️ não achei minha linha ('{s.char}') na Fortaleza dos Orcs — "
+                            f"agindo por segurança.")
+                sem_linha = 0
+                rounds += 1
+                rounds_almas += 1
+                await brain.act(rounds_almas)
+                _motivo_pocao = await _sair_pocao_agora()
                 if _motivo_pocao:
                     return _motivo_pocao
                 continue
@@ -7893,7 +11012,7 @@ async def run_cripta(sessions, baseline=0, continuar=False, retomar=False):
         s.caca_reforco_ratio = max(0, min(100, reforco_pct)) / 100.0
         s.alma_min_andar = alma_min_andar
 
-    if not continuar and not retomar:
+    async def _checar_pocao_antes_de_comecar():
         async def _checar_aviso(s):
             qtd = await contar_pocoes_vida(s)
             if qtd is not None:
@@ -7902,19 +11021,28 @@ async def run_cripta(sessions, baseline=0, continuar=False, retomar=False):
             return s, qtd
         for s, qtd in await asyncio.gather(*(_checar_aviso(s) for s in sessions)):
             if qtd is not None and qtd < pocao_aviso:
+                qtd = await tentar_comprar_pocao_automatico(s, qtd)
+                if qtd >= pocao_aviso:
+                    continue
                 await asyncio.to_thread(
                     popup_aviso, "TofuBot — Cripta",
                     f"Poção de Vida inferior a {pocao_aviso}!\n\n"
                     f"Conta {s.name}: {qtd} poções.\n\nFavor reabastecer.")
-                log(s.name, f"⏹ pausado antes de iniciar: {qtd} Poções de Vida (< {pocao_aviso}).")
+                log(s.name, f"⏹ pausado: {qtd} Poções de Vida (< {pocao_aviso}).")
                 registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd} (< {pocao_aviso})")
                 return False
+        return True
 
     host = sessions[0]
     joiners = sessions[1:]
     esta_volta_retoma = retomar
+    pular_checagem_pocao = continuar or retomar
     while True:
         try:
+            if not pular_checagem_pocao:
+                if not await _checar_pocao_antes_de_comecar():
+                    return False
+            pular_checagem_pocao = False
             estado = {"sair": None, "em_combate": {},
                       "roles": {s.name: s.role for s in sessions}}
             for s in sessions:
@@ -8039,6 +11167,11 @@ async def run_cripta(sessions, baseline=0, continuar=False, retomar=False):
                 log("bot", "⚠️ uma conta travou na Cripta — saindo e recomeçando pra não morrer.")
                 await asyncio.sleep(3.0)
                 continue
+            if "parar_e_sair" in motivos:
+                log("bot", "⏹️🚪 'Parar e Sair' atendido — o grupo saiu da Cripta. Parando.")
+                _registrar_cripta_desta_execucao()
+                registrar_pausa("parar_e_sair", "Cripta: pedido pelo usuário")
+                return False
             if "andar_limite" in motivos:
                 _registrar_cripta_desta_execucao()
 
@@ -8047,22 +11180,236 @@ async def run_cripta(sessions, baseline=0, continuar=False, retomar=False):
                 log("bot", f"🎯 atingiu o limite de {max_criptas} cripta(s) — parando o bot.")
                 registrar_pausa("limite_criptas", f"{feitas}/{max_criptas}")
                 return False
-            if parar_no_fim_pedido():
-                log("bot", "⏸ 'Parar no fim' atendido — cripta concluída, parando o bot.")
+            if parar_no_fim_pedido() or algum_membro_pausado(sessions):
+                log("bot", "⏸ 'Parar no fim' atendido (ou um membro pausado) — "
+                          "cripta concluída, parando o bot.")
                 registrar_pausa("parar_no_fim", "após concluir a cripta atual")
                 return False
 
             async def _talvez_atualizar_perfil(s):
                 s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
-                if s._contador_perfil % 3 == 0:
+                if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
                     await atualizar_perfil_e_estimativa(s)
                 await talvez_vender_no_mercado(s)
                 await talvez_ler_inventario(s)
+                await talvez_comprar_pocoes(s)
             await asyncio.gather(*(_talvez_atualizar_perfil(s) for s in sessions))
 
             await evitar_novo_conteudo_por_manutencao("cripta", rotulo="Cripta")
         except Exception as e:
             log("bot", f"💥 erro na Cripta: {e!r} — REINICIANDO pra continuar de onde parou.")
+            log("bot", "🔎 detalhe do erro:\n" + traceback.format_exc())
+            return True
+
+
+async def run_fortaleza_orcs(sessions, baseline=0, continuar=False, retomar=False):
+    """Roda a Fortaleza dos Orcs continuamente com N contas (1 a 5). Sala SEM
+    senha; se um INTRUSO entrar, sai todo mundo e recria. Sempre 3 salas +
+    BOSS, termina sozinha (tela '... — COMPLETA!'). 'retomar'=True: as
+    contas já estão numa Fortaleza ATIVA -> pula a formação e vai direto ao
+    combate. Retorna True se precisa REINICIAR o bot (erro), False se parou
+    de propósito (limite/morte/poção/skin)."""
+    if not (1 <= len(sessions) <= 5):
+        log("bot", f"❌ A Fortaleza dos Orcs precisa de 1 a 5 contas (tem {len(sessions)}).")
+        return False
+    cfg = config.FORTALEZA_ORCS
+    tipo = cfg.get("tipo", "fosso_de_provas")
+    tipo_label = FORTALEZA_TIPO_BOTAO.get(tipo, tipo)
+    max_execucoes = int(cfg.get("max_execucoes", 0))
+    pocao_minima = int(config.POCOES.get("pocao_vida_minima", 10))
+    pocao_aviso = int(config.POCOES.get("pocao_vida_aviso", 100))
+    vida_min_pct = int(config.POCOES.get("vida_min_pct", 40))
+    reforco_pct = int(config.POCOES.get("reforco_pct", 0))
+    nomes_nossos = [s.char for s in sessions]
+    log("bot", f"🏯 Fortaleza dos Orcs — {tipo_label}: {len(sessions)} conta(s)"
+               + (" — continuando após reinício." if continuar else "."))
+    for s in sessions:
+        s.pocao_minima_caca = pocao_minima
+        s.modo_caca = True
+        s.tank_ativo = True
+        vida_pct_conta = s.acc.get("vida_min_pct", s.acc.get("caca_vida_pct"))
+        vida_pct_conta = vida_min_pct if vida_pct_conta is None else int(vida_pct_conta)
+        s.caca_vida_ratio = max(0, min(100, vida_pct_conta)) / 100.0
+        s.caca_reforco_ratio = max(0, min(100, reforco_pct)) / 100.0
+
+    async def _checar_pocao_antes_de_comecar():
+        async def _checar_aviso(s):
+            qtd = await contar_pocoes_vida(s)
+            if qtd is not None:
+                s.pocoes_estimadas = qtd
+            log(s.name, f"🧪 Poções de Vida no estoque: {qtd if qtd is not None else 'não confirmado'}.")
+            return s, qtd
+        for s, qtd in await asyncio.gather(*(_checar_aviso(s) for s in sessions)):
+            if qtd is not None and qtd < pocao_aviso:
+                qtd = await tentar_comprar_pocao_automatico(s, qtd)
+                if qtd >= pocao_aviso:
+                    continue
+                await asyncio.to_thread(
+                    popup_aviso, "TofuBot — Fortaleza dos Orcs",
+                    f"Poção de Vida inferior a {pocao_aviso}!\n\n"
+                    f"Conta {s.name}: {qtd} poções.\n\nFavor reabastecer.")
+                log(s.name, f"⏹ pausado: {qtd} Poções de Vida (< {pocao_aviso}).")
+                registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd} (< {pocao_aviso})")
+                return False
+        return True
+
+    host = sessions[0]
+    joiners = sessions[1:]
+    esta_volta_retoma = retomar
+    pular_checagem_pocao = continuar or retomar
+    while True:
+        try:
+            if not pular_checagem_pocao:
+                if not await _checar_pocao_antes_de_comecar():
+                    return False
+            pular_checagem_pocao = False
+            estado = {"sair": None, "em_combate": {},
+                      "roles": {s.name: s.role for s in sessions}}
+            for s in sessions:
+                s.sair_caca_pocao = False
+                s._log_andar_uma_vez = True
+                s._log_alma_uma_vez = True
+
+            if esta_volta_retoma:
+                esta_volta_retoma = False
+                log("bot", "▶️ retomando a Fortaleza dos Orcs ATIVA (sem formar sala nova).")
+                for s in sessions:
+                    s._retomando_conteudo = True
+            else:
+                await asyncio.gather(*(limpar_historico(s) for s in sessions))
+                await asyncio.gather(*(heal_at_menu_if_low(s, s.caca_reforco_ratio) for s in sessions))
+
+                code = await host_criar_fortaleza(host, tipo)
+                if not code:
+                    log(host.name, f"❌ não criei a {tipo_label} — tentando de novo.")
+                    await asyncio.sleep(3.0)
+                    continue
+                oks = await asyncio.gather(*(joiner_entrar_fortaleza(s, code) for s in joiners))
+                if not all(oks):
+                    log("bot", "❌ nem todos entraram na Fortaleza dos Orcs — saindo e recriando.")
+                    await asyncio.gather(*(leave_room(s) for s in sessions))
+                    await asyncio.sleep(2.0)
+                    continue
+
+                await host.refresh()
+                if intruso_na_sala(host.text, nomes_nossos):
+                    log(host.name, "🚫 intruso na sala da Fortaleza dos Orcs — saindo todos e recriando.")
+                    await asyncio.gather(*(leave_room(s) for s in sessions))
+                    await asyncio.sleep(2.0)
+                    continue
+
+                await asyncio.gather(*(ready_up(s) for s in sessions))
+                await host.refresh()
+                if intruso_na_sala(host.text, nomes_nossos):
+                    log(host.name, "🚫 intruso entrou antes de iniciar — saindo todos e recriando.")
+                    await asyncio.gather(*(leave_room(s) for s in sessions))
+                    await asyncio.sleep(2.0)
+                    continue
+
+                if not await host_iniciar_fortaleza(host):
+                    log("bot", "⚠️ não consegui iniciar a Fortaleza dos Orcs — tentando de novo.")
+                    continue
+                if not await wait_combat_started(host):
+                    log("bot", "⚠️ combate da Fortaleza dos Orcs não começou a tempo — tentando de novo.")
+                    continue
+
+            log("bot", f"⚔️ jogando a {tipo_label}.")
+            _t_inicio_fortaleza = time.time()
+            for s in sessions:
+                s._t_inicio_conteudo = _t_inicio_fortaleza
+                s._combat_hb = estado
+            try:
+                motivos = await asyncio.gather(*(
+                    combat_loop_fortaleza(s, estado, nomes_nossos, tank_por_ultimo=True)
+                    for s in sessions))
+            finally:
+                for s in sessions:
+                    s._combat_hb = None
+
+            def _registrar_fortaleza_desta_execucao():
+                """Registra o progresso desta execução — tanto quando
+                completa de verdade quanto quando termina por morte/poção
+                (mesma lógica já usada na Cripta: sem isso, qualquer saída
+                que não seja 'completo' nunca entraria no relatório)."""
+                valores = {}
+                for s in sessions:
+                    txt_saida = getattr(s, "_saida_txt", "") or ""
+                    if "completa" in norm(txt_saida):
+                        resultados = parse_resultados_fortaleza(txt_saida)
+                        entrada = next((v for nome_res, v in resultados.items()
+                                        if _nome_bate(norm(s.char), norm(nome_res))
+                                        or _nome_bate(norm(nome_res), norm(s.char))), None)
+                        valores[s.name] = entrada if entrada else (0, 0)
+                    else:
+                        valores[s.name] = parse_saida_cripta(txt_saida)
+                gold_por_conta = {nome: g for nome, (x, g) in valores.items()}
+                xp_por_conta = {nome: x for nome, (x, g) in valores.items()}
+                duracao_segundos = time.time() - _t_inicio_fortaleza
+                try:
+                    total, media_seg = registrar_fortaleza_orcs(
+                        gold_por_conta, xp_por_conta, estado.get("drops_por_conta"),
+                        duracao_segundos=duracao_segundos, tipo=tipo)
+                except Exception as e:
+                    log("bot", f"(não consegui registrar a fortaleza dos orcs: {e!r})")
+                    total = int((_ler_relatorio() or {}).get("fortaleza_orcs_total", 0))
+                    media_seg = None
+                feitas = total - baseline
+                if media_seg:
+                    _salvar_estimativa("fortaleza_orcs", "fortaleza_orcs", feitas, max_execucoes, media_seg)
+                xp_c = max(xp_por_conta.values()) if xp_por_conta else 0
+                gold_c = max(gold_por_conta.values()) if gold_por_conta else 0
+                log("bot", f"🏁 {tipo_label} #{total} registrada ({feitas} desde que iniciou)."
+                           f"  ⭐ {xp_c} XP · 💰 {gold_c} gold (por conta — todo mundo recebe igual)")
+
+            if "morte" in motivos:
+                log("bot", "⏹ pausando a Fortaleza dos Orcs (alguém morreu — todos saíram).")
+                _registrar_fortaleza_desta_execucao()
+                registrar_pausa("morte", "detectado na Fortaleza dos Orcs")
+                return False
+            if "pocao_baixa" in motivos:
+                log("bot", "⏹ pausando a Fortaleza dos Orcs (Poções de Vida baixas).")
+                _registrar_fortaleza_desta_execucao()
+                registrar_pausa("pocao_vida_baixa", "acabando durante a Fortaleza dos Orcs")
+                await asyncio.to_thread(
+                    popup_aviso, "TofuBot — Fortaleza dos Orcs",
+                    "As Poções de Vida acabaram DURANTE a Fortaleza dos Orcs!\n\n"
+                    "O grupo já saiu. Reabasteça e clique Iniciar de novo.")
+                return False
+            if "travou" in motivos:
+                log("bot", "⚠️ uma conta travou na Fortaleza dos Orcs — saindo e recomeçando pra não morrer.")
+                await asyncio.sleep(3.0)
+                continue
+            if "parar_e_sair" in motivos:
+                log("bot", "⏹️🚪 'Parar e Sair' atendido — o grupo saiu da Fortaleza dos Orcs. Parando.")
+                _registrar_fortaleza_desta_execucao()
+                registrar_pausa("parar_e_sair", "Fortaleza dos Orcs: pedido pelo usuário")
+                return False
+            if "completo" in motivos:
+                _registrar_fortaleza_desta_execucao()
+
+            feitas = int((_ler_relatorio() or {}).get("fortaleza_orcs_total", 0)) - baseline
+            if max_execucoes and feitas >= max_execucoes:
+                log("bot", f"🎯 atingiu o limite de {max_execucoes} execuç(ões) — parando o bot.")
+                registrar_pausa("limite_fortaleza_orcs", f"{feitas}/{max_execucoes}")
+                return False
+            if parar_no_fim_pedido() or algum_membro_pausado(sessions):
+                log("bot", "⏸ 'Parar no fim' atendido (ou um membro pausado) — "
+                          "Fortaleza dos Orcs concluída, parando o bot.")
+                registrar_pausa("parar_no_fim", "após concluir a Fortaleza dos Orcs atual")
+                return False
+
+            async def _talvez_atualizar_perfil(s):
+                s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
+                if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
+                    await atualizar_perfil_e_estimativa(s)
+                await talvez_vender_no_mercado(s)
+                await talvez_ler_inventario(s)
+                await talvez_comprar_pocoes(s)
+            await asyncio.gather(*(_talvez_atualizar_perfil(s) for s in sessions))
+
+            await evitar_novo_conteudo_por_manutencao("fortaleza_orcs", rotulo="Fortaleza dos Orcs")
+        except Exception as e:
+            log("bot", f"💥 erro na Fortaleza dos Orcs: {e!r} — REINICIANDO pra continuar de onde parou.")
             log("bot", "🔎 detalhe do erro:\n" + traceback.format_exc())
             return True
 
@@ -8120,7 +11467,7 @@ async def sync_barrier(barrier: asyncio.Barrier, s: Session, label: str) -> bool
         return False
 
 
-async def run_account(s: Session, shared, barrier, n):
+async def run_account(s: Session, shared, barrier, n, retomando: bool = False):
     """
     LOOP contínuo: uma masmorra após a outra. Se ao começar já houver uma
     masmorra ativa com todos vivos, CONTINUA ela (não sai). Ao concluir, volta
@@ -8141,23 +11488,59 @@ async def run_account(s: Session, shared, barrier, n):
     # tinham): se o estoque já estiver baixo desde o início, avisa com
     # pop-up e pausa o bot, em vez de só descobrir isso já no meio da
     # primeira masmorra.
-    qtd_inicial = await contar_pocoes_vida(s)
-    log(s.name, f"🧪 Poções de Vida no estoque: {qtd_inicial if qtd_inicial is not None else 'não confirmado'}.")
-    if qtd_inicial is not None and qtd_inicial < pocao_aviso:
-        await asyncio.to_thread(
-            popup_aviso, "TofuBot — Masmorra",
-            f"Poção de Vida inferior a {pocao_aviso}!\n\n"
-            f"Conta {s.name}: {qtd_inicial} poções.\n\nFavor reabastecer.")
-        log(s.name, f"⏹ pausado antes de iniciar: {qtd_inicial} Poções de Vida (< {pocao_aviso}).")
-        registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd_inicial} (< {pocao_aviso})")
-        shared["stop"].set()
-        return
+    # BUG REAL corrigido 2026-07-20 (usuário: reiniciou no meio da masmorra,
+    # "masmorra ativa detectada — continuando" apareceu certinho, MAS essa
+    # checagem de poção rodou mesmo assim pras 4 contas — "não consegui
+    # confirmar a quantidade de Poção de Vida", seguido de várias "tela
+    # travada" — mesma causa raiz já corrigida em run_caca_dupla 2026-07-16:
+    # contar_pocoes_vida() chama back_to_menu() por dentro, que sem 'Menu'/
+    # 'Viajar' disponíveis durante o combate cai num /start de última
+    # instância, tirando a conta da tela de combate à toa). Agora pula essa
+    # checagem quando a conta já está sendo RETOMADA em combate (o parâmetro
+    # 'retomando', decidido em main() pelo mesmo sessions_ja_em_combate que
+    # já pula a viagem pro mapa).
+    if not retomando:
+        qtd_inicial = await contar_pocoes_vida(s)
+        log(s.name, f"🧪 Poções de Vida no estoque: {qtd_inicial if qtd_inicial is not None else 'não confirmado'}.")
+        if qtd_inicial is not None and qtd_inicial < pocao_aviso:
+            qtd_inicial = await tentar_comprar_pocao_automatico(s, qtd_inicial)
+        if qtd_inicial is not None and qtd_inicial < pocao_aviso:
+            await asyncio.to_thread(
+                popup_aviso, "TofuBot — Masmorra",
+                f"Poção de Vida inferior a {pocao_aviso}!\n\n"
+                f"Conta {s.name}: {qtd_inicial} poções.\n\nFavor reabastecer.")
+            log(s.name, f"⏹ pausado antes de iniciar: {qtd_inicial} Poções de Vida (< {pocao_aviso}).")
+            registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd_inicial} (< {pocao_aviso})")
+            shared["stop"].set()
+            return
 
     perdido_espera = 0   # quantas vezes seguidas esperei o grupo (me perdi da masmorra)
+    # nomes do grupo pra someone_died não confundir morte de MOB (Minas
+    # imprimem "X foi derrotado" na transição de andar) com morte de jogador
+    _nomes_grupo_ra = [x.char for x in (shared.get("sessions") or []) if getattr(x, "char", None)]
     while True:
         if shared["restart"].is_set():   # reinício automático solicitado
             return
         if shared["stop"].is_set():       # limite de masmorras atingido
+            # CORRIGIDO 2026-07-21 (usuário: "após alguém morrer, todos os
+            # outros saírem às vezes não dá certo — acho que é pq o bot se
+            # desliga sozinho"): a morte é justamente a hora em que a tela
+            # muda bruscamente — se uma exceção estourar numa OUTRA conta
+            # nesse instante (FloodWait/rede), o handler lá embaixo engole
+            # o erro e o loop volta pra cá, onde o 'stop' (setado pela
+            # morte) fazia a conta retornar SEM nunca ter saído da sala.
+            # Todas as tasks terminavam, o processo encerrava ("se desliga
+            # sozinho") e a conta ficava presa dentro do conteúdo. Agora,
+            # antes de encerrar, confere se ainda está em combate/na tela
+            # de morte e sai da sala primeiro.
+            try:
+                await s.refresh()
+                if is_combat_screen(s.message) or someone_died(s.text, _nomes_grupo_ra):
+                    log(s.name, "🚪 ainda dentro da sala na hora de parar — "
+                                "saindo antes de encerrar.")
+                    await leave_room(s)
+            except Exception as e:
+                log(s.name, f"(não consegui confirmar/sair da sala ao parar: {e!r})")
             log(s.name, "⏹ parado (limite de masmorras atingido).")
             return
         try:
@@ -8171,11 +11554,11 @@ async def run_account(s: Session, shared, barrier, n):
             # há masmorra ativa, tenta clicar num botão expirado ("Encrypted data
             # invalid") e dessincroniza (bug real 2026-07-03, causava loop de
             # reinício). Confirmar 2x seguidas evita agir em cima de tela velha.
-            resume = is_combat_screen(s.message) and not someone_died(s.text)
+            resume = is_combat_screen(s.message) and not someone_died(s.text, _nomes_grupo_ra)
             if resume:
                 await poll_sleep()
                 await s.refresh()
-                resume = is_combat_screen(s.message) and not someone_died(s.text)
+                resume = is_combat_screen(s.message) and not someone_died(s.text, _nomes_grupo_ra)
 
             if resume:
                 log(s.name, "▶️ masmorra ativa detectada — continuando (sem sair, "
@@ -8239,29 +11622,60 @@ async def run_account(s: Session, shared, barrier, n):
                     if qtd2 is None or qtd2 >= pocao_minima:
                         log(s.name, "✅ 2ª leitura não confirmou estoque baixo — seguindo normal.")
                     else:
-                        log(s.name, f"⚠️ menos de {pocao_minima} Poções de Vida "
-                                    f"({qtd2}) confirmado em 2 leituras — todas as contas saem e o bot pausa.")
-                        # sinaliza pra TODAS saírem/pararem (não só esta conta):
-                        # leave_event faz quem estiver em combate sair; stop
-                        # impede formar/continuar masmorra.
-                        shared["leave_event"].set()
-                        shared["stop"].set()
-                        registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd2} poções")
-                        await asyncio.to_thread(
-                            popup_aviso, "TofuBot — Masmorra",
-                            f"Poção de Vida abaixo de {pocao_minima}!\n\n"
-                            f"Conta {s.name}: {qtd2} poções.\n\nReabasteça e clique Iniciar de novo.")
-                        return
+                        # CORRIGIDO 2026-07-23 (usuário: "ao identificar isso,
+                        # já ir comprar a pot?... bote em todos os conteúdos" —
+                        # este é o ponto que já rodava a CADA masmorra nova
+                        # (não só a 1ª da sessão), decisão 100% individual sem
+                        # barreira — o lugar ideal pra tentar comprar antes de
+                        # desistir e pausar todo mundo.
+                        qtd2 = await tentar_comprar_pocao_automatico(s, qtd2)
+                        if qtd2 >= pocao_minima:
+                            log(s.name, "✅ compra automática resolveu — seguindo normal.")
+                        else:
+                            log(s.name, f"⚠️ menos de {pocao_minima} Poções de Vida "
+                                        f"({qtd2}) confirmado em 2 leituras — todas as contas saem e o bot pausa.")
+                            # sinaliza pra TODAS saírem/pararem (não só esta conta):
+                            # leave_event faz quem estiver em combate sair; stop
+                            # impede formar/continuar masmorra.
+                            shared["leave_event"].set()
+                            shared["stop"].set()
+                            registrar_pausa("pocao_vida_baixa", f"{s.name}: {qtd2} poções")
+                            await asyncio.to_thread(
+                                popup_aviso, "TofuBot — Masmorra",
+                                f"Poção de Vida abaixo de {pocao_minima}!\n\n"
+                                f"Conta {s.name}: {qtd2} poções.\n\nReabasteça e clique Iniciar de novo.")
+                            return
 
                 # --- lê chaves e todos decidem o host (conta com mais chaves) ---
-                shared["keys"][s.name] = await read_keys_at_menu(s)
+                # BUG REAL corrigido 2026-07-20 (usuário: "ele identifica a
+                # chave de masmorra, que não é essa que usa" — Covil do
+                # Lord usa "Chave do Ossuário", escondida em Inventário ->
+                # Ferramentas, NADA a ver com "Chaves de Masmorra" do menu
+                # principal). Se a masmorra alternativa atual tiver
+                # "chave_inventario" configurado, lê de lá em vez do menu.
+                _alt_chave = getattr(config, "MASMORRAS_ALTERNATIVAS", {}).get(config.TIPO_MASMORRA, {})
+                _nome_chave_especial = _alt_chave.get("chave_inventario")
+                # DIAGNÓSTICO (2026-07-20, usuário: "ainda não foi" — o log
+                # mostrou "142 chaves" de novo, número que parece ser das
+                # Chaves de Masmorra normais, não da Chave do Ossuário).
+                # Mostra qual caminho o código pegou de VERDADE, pra
+                # confirmar se TIPO_MASMORRA chegou como 'covil_do_lord'
+                # aqui ou não, em vez de continuar chutando.
+                if getattr(config, "LOG_DEBUG_VERBOSE", False):
+                    log(s.name, f"🔎 DEBUG leitura de chave: TIPO_MASMORRA='{config.TIPO_MASMORRA}' "
+                                f"-> chave_inventario={_nome_chave_especial!r}")
+                if _nome_chave_especial:
+                    shared["keys"][s.name] = await ler_chave_especial_inventario(s, _nome_chave_especial)
+                else:
+                    shared["keys"][s.name] = await read_keys_at_menu(s)
                 if not await sync_barrier(barrier, s, "leitura de chaves"):
                     shared["restart"].set()
                     return
                 host_name = max(shared["keys"], key=lambda k: shared["keys"][k])
                 is_host = (s.name == host_name)
                 if shared["keys"].get(host_name, 0) <= 0:
-                    log(s.name, "❌ nenhuma conta tem Chave de Masmorra. Parando.")
+                    nome_chave_log = _nome_chave_especial or "Chave de Masmorra"
+                    log(s.name, f"❌ nenhuma conta tem {nome_chave_log}. Parando.")
                     return
                 if is_host:
                     shared["leave_event"].clear()   # nova masmorra: zera o sinal de saída
@@ -8280,11 +11694,36 @@ async def run_account(s: Session, shared, barrier, n):
                     code = await host_create_room(s, config.SALA_SENHA)
                     shared["code"] = code
                     if not code:
+                        falta = getattr(s, "_falta_chave_especial", None)
+                        if falta:
+                            log(s.name, f"⏸ pausando (chave especial insuficiente: {falta}).")
+                            registrar_pausa("chave_especial_insuficiente", falta)
+                            await asyncio.to_thread(
+                                popup_aviso, "TofuBot — Masmorra",
+                                f"Não deu pra criar a sala: {falta}\n\n"
+                                f"Isso pede um item especial (comprado com moeda "
+                                f"própria, não reponho sozinho). Resolva no jogo e "
+                                f"clique Iniciar de novo.")
+                            shared["stop"].set()
+                            return
                         log(s.name, "❌ host não criou a sala — reinício automático.")
                         shared["restart"].set()
                         return
                     await ready_up(s)
-                    await host_start(s, n)
+                    # Salas SEM senha (Minas): o host vigia INTRUSOS antes de
+                    # clicar Iniciar (pedido do usuário 2026-07-21: "se
+                    # atentar se tem intruso, se tiver, sair e criar de novo").
+                    _alt_lobby = getattr(config, "MASMORRAS_ALTERNATIVAS", {}).get(config.TIPO_MASMORRA) or {}
+                    _nomes_grupo = ([x.char for x in (shared.get("sessions") or [])
+                                     if getattr(x, "char", None)]
+                                    if _alt_lobby.get("sem_senha") else None)
+                    _r_start = await host_start(s, n, nomes_nossos=_nomes_grupo)
+                    if _r_start == "intruso":
+                        log(s.name, "🚫 intruso na sala — saindo e recriando do zero "
+                                    "(reinício automático).")
+                        await leave_room(s)   # líder saindo dissolve a sala
+                        shared["restart"].set()
+                        return
                 else:
                     code = None
                     for _ in range(int(config.LOBBY_TIMEOUT / config.POLL_INTERVAL)):
@@ -8310,7 +11749,14 @@ async def run_account(s: Session, shared, barrier, n):
             log(s.name, "⚔️ jogando a masmorra.")
             _t_inicio_masmorra = time.time()
             s._t_inicio_conteudo = _t_inicio_masmorra
-            await combat_loop(s, leave_event, shared["restart"], shared)
+            # Minas (2026-07-21): a tela final diz "— COMPLETA!" (não
+            # "concluída") — o marcador extra vem do config da alternativa,
+            # genérico pra qualquer masmorra futura com texto próprio.
+            _alt_marc = getattr(config, "MASMORRAS_ALTERNATIVAS", {}).get(config.TIPO_MASMORRA) or {}
+            _marcadores = ("conclu", _alt_marc["marcador_fim"]) if _alt_marc.get("marcador_fim") \
+                else ("conclu",)
+            await combat_loop(s, leave_event, shared["restart"], shared,
+                              marcadores_fim=_marcadores)
             s._combat_hb = None   # saiu do combate: para de publicar batimento
 
             # registra a masmorra concluída (só a conta 'recorder', pra não
@@ -8319,10 +11765,24 @@ async def run_account(s: Session, shared, barrier, n):
             # conclusão (shared["conclusao"]); se por algum motivo não houver,
             # cai pra reler a tela (compatível com o comportamento antigo).
             texto_final = shared.get("conclusao", {}).get(s.name)
-            if not (texto_final and "conclu" in norm(texto_final)):
+            # a tela final pode dizer "concluída" (padrão) OU o marcador da
+            # masmorra alternativa (Minas: "COMPLETA!") — aceita os dois.
+            def _tela_final_ok(t):
+                nt = norm(t or "")
+                return "conclu" in nt or (_alt_marc.get("marcador_fim")
+                                          and _alt_marc["marcador_fim"] in nt)
+            if not (texto_final and _tela_final_ok(texto_final)):
                 await s.refresh()
                 texto_final = s.text
-            if s.name == shared["recorder"] and "conclu" in norm(texto_final):
+            # MINAS com morte: a tela de saída não diz "COMPLETA", mas ainda
+            # tem XP/gold/drop — tenta registrar se a alternativa usa
+            # resultado_final E capturamos algo na saída.
+            _morte_minas = (
+                _alt_marc.get("resultado_final")
+                and shared.get("morte_registrada")
+                and not _tela_final_ok(texto_final)
+            )
+            if s.name == shared["recorder"] and (_tela_final_ok(texto_final) or _morte_minas):
                 atualizar_recompensas(shared, texto_final)   # pega qualquer recompensa da tela final também
                 dano = parse_ranking_dano(texto_final)
                 # BUG REAL corrigido (prints do usuário 2026-07-15: masmorra de
@@ -8356,30 +11816,89 @@ async def run_account(s: Session, shared, barrier, n):
                 _alt_atual = getattr(config, "MASMORRAS_ALTERNATIVAS", {}).get(config.TIPO_MASMORRA)
                 mapa_desta_masmorra = _alt_atual["rotulo"] if _alt_atual \
                     else (config.MAPA_DESTINO or None)
+                # MINAS (2026-07-21): XP/gold/drop só existem na TELA FINAL
+                # ("— COMPLETA!") — não há blocos de recompensa por mob no
+                # combate, então o acumulado normal chega VAZIO aqui. Quando
+                # a alternativa marca 'resultado_final', o parser da tela
+                # final SUPRE o acumulado (e as raridades do drop).
+                if _alt_atual and _alt_atual.get("resultado_final"):
+                    _res_minas = parse_resultado_minas(texto_final)
+                    if _res_minas and _res_minas[0].get("jogadores"):
+                        acumulado_final = _res_minas[0]
+                        raridades_final.update(_res_minas[1])
+                    elif _morte_minas and shared.get("conclusao_minas_morte"):
+                        # saída por morte: sem tela COMPLETA, mas capturamos
+                        # XP/Gold da tela "Progresso acumulado" (parse_saida_cripta).
+                        # Se AMBOS são zero (Minas só recompensam no boss final —
+                        # morte antes = sem nada), não registra a run pra não
+                        # poluir o relatório com linha vazia (XP=0, gold=0).
+                        _cm = shared["conclusao_minas_morte"]
+                        if _cm.get("xp_total", 0) or any(
+                                v.get("gold", 0) for v in (_cm.get("jogadores") or {}).values()):
+                            acumulado_final = _cm
+                        else:
+                            log(s.name, "ℹ️ morte nas Minas com 0 XP e 0 gold — "
+                                        "run não registrada (sem recompensa acumulada).")
+                            acumulado_final = None
                 _grupo_sessions = shared.get("sessions") or [s]
-                dano_mapeado = _mapear_nomes_para_conta(dano, _grupo_sessions)
-                acumulado_final_mapeado = dict(acumulado_final or {})
-                acumulado_final_mapeado["jogadores"] = _mapear_nomes_para_conta(
-                    (acumulado_final or {}).get("jogadores"), _grupo_sessions)
-                total, media_seg = registrar_masmorra(
-                    texto_final, dano_mapeado, acumulado_final_mapeado,
-                    duracao_segundos=time.time() - _t_inicio_masmorra,
-                    raridades=raridades_final, mapa=mapa_desta_masmorra)
-                feitas_na_execucao = total - shared["baseline"]
-                shared["dungeons_done"] = feitas_na_execucao
-                if media_seg:
-                    chave_tempo = f"masmorra:{mapa_desta_masmorra}" if mapa_desta_masmorra else "masmorra"
-                    _salvar_estimativa("masmorra", chave_tempo, feitas_na_execucao,
-                                       config.MAX_DUNGEONS, media_seg)
-                log(s.name, f"🏁 masmorra #{total} concluída e registrada. "
-                            f"({feitas_na_execucao} desde que iniciou)")
-                if config.MAX_DUNGEONS and feitas_na_execucao >= config.MAX_DUNGEONS:
-                    log(s.name, f"🎯 atingiu o limite de {config.MAX_DUNGEONS} masmorra(s) desde o início — parando o bot.")
-                    shared["stop"].set()
-                    registrar_pausa("limite_masmorras", f"{feitas_na_execucao}/{config.MAX_DUNGEONS}")
-                elif parar_no_fim_pedido():
-                    log(s.name, "⏸ 'Parar no fim' atendido — masmorra concluída, parando.")
-                    shared["stop"].set()
+                if acumulado_final is None and _morte_minas:
+                    pass   # já logado acima — não registra run vazia
+                else:
+                    dano_mapeado = _mapear_nomes_para_conta(dano, _grupo_sessions)
+                    acumulado_final_mapeado = dict(acumulado_final or {})
+                    acumulado_final_mapeado["jogadores"] = _mapear_nomes_para_conta(
+                        (acumulado_final or {}).get("jogadores"), _grupo_sessions)
+                    total, media_seg = registrar_masmorra(
+                        texto_final, dano_mapeado, acumulado_final_mapeado,
+                        duracao_segundos=time.time() - _t_inicio_masmorra,
+                        raridades=raridades_final, mapa=mapa_desta_masmorra)
+                    feitas_na_execucao = total - shared["baseline"]
+                    shared["dungeons_done"] = feitas_na_execucao
+                    if media_seg:
+                        chave_tempo = f"masmorra:{mapa_desta_masmorra}" if mapa_desta_masmorra else "masmorra"
+                        _salvar_estimativa("masmorra", chave_tempo, feitas_na_execucao,
+                                           config.MAX_DUNGEONS, media_seg)
+                    log(s.name, f"🏁 masmorra #{total} concluída e registrada. "
+                                f"({feitas_na_execucao} desde que iniciou)")
+                    if config.MAX_DUNGEONS and feitas_na_execucao >= config.MAX_DUNGEONS:
+                        log(s.name, f"🎯 atingiu o limite de {config.MAX_DUNGEONS} masmorra(s) desde o início — parando o bot.")
+                        shared["stop"].set()
+                        registrar_pausa("limite_masmorras", f"{feitas_na_execucao}/{config.MAX_DUNGEONS}")
+                    elif parar_no_fim_pedido() or algum_membro_pausado(shared["sessions"]):
+                        log(s.name, "⏸ 'Parar no fim' atendido (ou um membro pausado) — "
+                                   "masmorra concluída, parando.")
+                        shared["stop"].set()
+                        registrar_pausa("parar_no_fim", "após concluir a masmorra atual")
+
+            # CORRIGIDO 2026-07-21 (usuário: "o parar ao terminar em Zuzu não
+            # funcionou... ele entrou novamente na dung", tanto pelo painel
+            # quanto pelo Telegram). A checagem acima está DENTRO do guard
+            # "sou o recorder E a tela de conclusão foi lida" — dois furos:
+            #   1) se a tela de conclusão dessa run não for capturada legível,
+            #      NINGUÉM checa o pedido e o ciclo forma a próxima masmorra;
+            #   2) corrida: enquanto o recorder ainda registra (parse + I/O),
+            #      as outras contas passam pelo stop-check com ele ainda
+            #      desarmado, partem pra formação e ficam penduradas na
+            #      barreira de chaves esperando o recorder (que setou stop e
+            #      saiu) -> timeout de 120s -> reinício automático -> dungeon
+            #      nova de qualquer jeito.
+            # Agora CADA conta checa o flag por si, aqui, assim que o combate
+            # termina — sem depender do recorder nem da tela de conclusão.
+            # Não roda se há reinício pendente (o relançamento RETOMA o
+            # conteúdo; o flag sobrevive de propósito e é atendido depois).
+            # Inclui também 'algum_membro_pausado' (pedido do usuário
+            # 2026-07-23: "detecta algum bug, pausa ela...") — pausar 1
+            # membro de um grupo de Masmorra não dá pra fazer no meio da
+            # luta (a barreira exige todos agindo junto), então o grupo
+            # inteiro para aqui, no mesmo ponto seguro do 'Parar no fim'.
+            if ((parar_no_fim_pedido() or algum_membro_pausado(shared["sessions"]))
+                    and not shared["restart"].is_set()
+                    and not shared["stop"].is_set()):
+                log(s.name, "⏸ 'Parar no fim' atendido (ou um membro pausado) — "
+                           "conteúdo encerrado, parando.")
+                shared["stop"].set()
+                if not shared.get("parar_no_fim_registrado"):
+                    shared["parar_no_fim_registrado"] = True
                     registrar_pausa("parar_no_fim", "após concluir a masmorra atual")
 
             if shared["stop"].is_set():
@@ -8402,10 +11921,11 @@ async def run_account(s: Session, shared, barrier, n):
             # navegação a mais, não vale a pena fazer toda hora) e alimenta
             # o Status ao vivo via write_status (ver Brain.act()).
             s._contador_perfil = getattr(s, "_contador_perfil", 0) + 1
-            if s._contador_perfil % 3 == 0:
+            if s._contador_perfil == 1 or s._contador_perfil % 3 == 0:
                 await atualizar_perfil_e_estimativa(s)
             await talvez_vender_no_mercado(s)
             await talvez_ler_inventario(s)
+            await talvez_comprar_pocoes(s)
             log(s.name, "🔁 masmorra encerrada — recomeçando o ciclo.")
 
         except asyncio.BrokenBarrierError:
@@ -8415,13 +11935,17 @@ async def run_account(s: Session, shared, barrier, n):
             await asyncio.sleep(2.0)
 
 
-async def _login_contas_mercado(rotulo_modo: str):
+async def _login_contas_mercado(rotulo_modo: str, contas_override: list = None):
     """Login MÍNIMO (sem entrar em masmorra/caçada/etc) só das contas
-    marcadas em config.MERCADO_CONTAS — usado tanto por 'Vender agora'
-    quanto 'Ler inventário agora' (modos autônomos: ligam, fazem 1 coisa,
-    desligam sozinhos). 'rotulo_modo' é só pro texto dos logs (ex: 'Vender
-    agora', 'Ler inventário agora')."""
-    contas_ok = getattr(config, "MERCADO_CONTAS", None) or []
+    marcadas — usado tanto por 'Vender agora' quanto 'Ler inventário agora'
+    (modos autônomos: ligam, fazem 1 coisa, desligam sozinhos).
+    'rotulo_modo' é só pro texto dos logs (ex: 'Vender agora', 'Ler
+    inventário agora'). 'contas_override' (pedido do usuário 2026-07-22:
+    "tem como escolher quais contas quer comprar?" — Comprar poções agora
+    permite escolher contas ESPECÍFICAS por pedido, em vez de sempre usar
+    TODAS as marcadas em config.MERCADO_CONTAS): lista de telefones — se
+    informada, usa ELA no lugar de config.MERCADO_CONTAS."""
+    contas_ok = contas_override if contas_override is not None else (getattr(config, "MERCADO_CONTAS", None) or [])
     contas_config = [a for a in config.ACCOUNTS if a.get("phone", "").strip() in contas_ok]
     if not contas_config:
         log("bot", f"❌ {rotulo_modo}: nenhuma conta marcada em 'Contas que vendem' (aba Mercado).")
@@ -8457,15 +11981,18 @@ async def _login_contas_mercado(rotulo_modo: str):
     return sessions
 
 
-async def _rodar_vender_e_sair():
+async def _rodar_vender_e_sair(contas_override=None):
     """Modo especial 'Vender agora' com o bot DESLIGADO (pedido do usuário
     2026-07-15) — loga só as contas marcadas em config.MERCADO_CONTAS (aba
     Mercado), vende os itens configurados, e volta (quem chama isso, main(),
-    encerra o processo em seguida)."""
+    encerra o processo em seguida). 'contas_override' (pedido do usuário
+    2026-07-23: "tem como selecionar lá quem vende?"): lista de telefones —
+    se informada (pedido feito pelo Telegram escolhendo contas), SÓ elas
+    vendem, em vez de todas as marcadas na aba Mercado."""
     if not (getattr(config, "MERCADO_ITENS", None) or []):
         log("bot", "❌ Vender agora: nenhum item marcado pra vender (aba Mercado).")
         return
-    sessions = await _login_contas_mercado("Vender agora")
+    sessions = await _login_contas_mercado("Vender agora", contas_override=contas_override)
     if not sessions:
         return
     log("bot", f"🛒 Vender agora: vendendo com {len(sessions)} conta(s)…")
@@ -8511,7 +12038,9 @@ async def _rodar_ler_inventario_e_sair():
         if atraso:
             await asyncio.sleep(atraso)
         try:
-            total = await ler_itens_inventario(s)
+            # Trocado 2026-07-19: lê pela loja (ver ler_itens_loja) em vez do
+            # Inventário — mais rápido e mais confiável (pedido do usuário).
+            total = await ler_itens_loja(s)
             log(s.name, f"📦 Ler inventário agora: concluído ({total} item(ns) vistos).")
         except Exception as e:
             log(s.name, f"⚠️ Ler inventário agora: erro — {e!r}")
@@ -8524,6 +12053,75 @@ async def _rodar_ler_inventario_e_sair():
         except Exception:
             pass
     log("bot", "📦 Ler inventário agora: concluído pra todas as contas — encerrando sozinho.")
+
+
+async def _rodar_comprar_pocoes_e_sair(pedido: dict = None):
+    """Modo especial 'Comprar poções' com o bot DESLIGADO (pedido do usuário
+    2026-07-21: "digito uma quantidade e ele vai na loja e compra?") — mesmo
+    esquema do 'Vender agora': loga só as contas marcadas em
+    config.MERCADO_CONTAS, compra a quantidade pedida de Poção de Vida ou
+    Energia (viajando pra config.MERCADO_MAPA_COMPRA, confirmado pelo
+    usuário como sendo sempre a Planície), e volta (quem chama isso, main(),
+    encerra o processo em seguida). 'pedido' vem PRONTO de quem chamou
+    (main() lê o JSON do COMPRAR_POCOES_E_SAIR_FLAG ANTES de apagar o
+    arquivo — CORRIGIDO 2026-07-22: antes esta função tentava reler o
+    arquivo ela mesma, mas o main() já tinha apagado ele antes de chamar
+    aqui, então dava sempre 'pedido não encontrado'). Sem 'pedido' (chamada
+    direta/teste), cai no fallback de ler os 2 flags do disco."""
+    if pedido is None:
+        pedido = comprar_pocoes_pedido()
+    if not pedido:
+        log("bot", "❌ Comprar poções: pedido não encontrado ou corrompido.")
+        return
+    tipo = pedido.get("tipo")
+    quantidade = int(pedido.get("quantidade", 0) or 0)
+    nome_item = ITEM_LOJA_POR_TIPO.get(tipo, tipo)
+    if not tipo or quantidade <= 0:
+        log("bot", f"❌ Comprar poções: pedido inválido (tipo={tipo!r}, quantidade={quantidade}).")
+        return
+    contas_pedido = pedido.get("contas")   # None = usa config.MERCADO_CONTAS (padrão de sempre)
+    sessions = await _login_contas_mercado("Comprar poções", contas_override=contas_pedido)
+    if not sessions:
+        return
+    log("bot", f"🛒 Comprar poções: comprando {quantidade}x {nome_item} "
+               f"com {len(sessions)} conta(s)…")
+
+    resultados = {}
+
+    async def _comprar_uma(s, atraso=0.0):
+        # Mesmo escalonamento do 'Vender agora' (evita rajada simultânea
+        # de todas as contas logo após o login).
+        if atraso:
+            await asyncio.sleep(atraso)
+        try:
+            comprado, gasto = await comprar_item_loja(s, tipo, quantidade)
+            resultados[s.name] = (comprado, gasto)
+            log(s.name, f"🛒 Comprar poções: concluído — {comprado}x {nome_item}, "
+                        + f"{gasto:,}".replace(",", ".") + " gold gastos.")
+        except Exception as e:
+            log(s.name, f"⚠️ Comprar poções: erro — {e!r}")
+            resultados[s.name] = (0, 0)
+
+    await asyncio.gather(*(_comprar_uma(s, i * 3.0 + random.uniform(0, 1.0))
+                           for i, s in enumerate(sessions)))
+    for s in sessions:
+        try:
+            await s.client.disconnect()
+        except Exception:
+            pass
+    total_comprado = sum(c for c, _ in resultados.values())
+    total_gasto = sum(g for _, g in resultados.values())
+    log("bot", f"🛒 Comprar poções: concluído pra todas as contas — "
+               f"{total_comprado}x {nome_item} no total, "
+               + f"{total_gasto:,}".replace(",", ".") + " gold gastos. Encerrando sozinho.")
+    # Evento pro Telegram avisar o resultado (mesmo mecanismo dos outros
+    # avisos automáticos — ver _registrar_evento/telegram_controle.py).
+    try:
+        detalhes = " · ".join(f"{nome}: {c}x" for nome, (c, _g) in resultados.items() if c)
+        _registrar_evento("compra_pocoes", nome_item=nome_item, total=total_comprado,
+                          gasto=total_gasto, detalhes=detalhes)
+    except Exception:
+        pass
 
 
 async def main():
@@ -8541,11 +12139,24 @@ async def main():
     # reinicia, ver o if __name__ == "__main__" no fim do arquivo), sem
     # entrar em nenhum dos 6 conteúdos normais.
     if os.path.exists(VENDER_E_SAIR_FLAG):
+        # Lê as contas ANTES de apagar o arquivo (mesma armadilha já
+        # corrigida na compra de poções: o padrão antigo apagava primeiro e
+        # a função tentava ler depois um arquivo que não existia mais).
+        # Formato antigo (só "1" ou timestamp) => contas_do_pedido = None
+        # => vale o padrão de sempre (todas as contas da aba Mercado).
+        contas_do_pedido = None
+        try:
+            with open(VENDER_E_SAIR_FLAG, encoding="utf-8") as f:
+                _d = json.loads(f.read().strip())
+            if isinstance(_d, dict):
+                contas_do_pedido = _d.get("contas")
+        except Exception:
+            pass
         try:
             os.remove(VENDER_E_SAIR_FLAG)
         except OSError:
             pass
-        await _rodar_vender_e_sair()
+        await _rodar_vender_e_sair(contas_override=contas_do_pedido)
         return False
 
     # "📦 Ler inventário agora" com o bot DESLIGADO — mesma ideia do 'Vender
@@ -8559,6 +12170,27 @@ async def main():
         await _rodar_ler_inventario_e_sair()
         return False
 
+    # "🧪 Comprar poções" com o bot DESLIGADO (pedido do usuário 2026-07-21)
+    # — mesma ideia do 'Vender agora', só que compra Poção de Vida/Energia
+    # na quantidade pedida (viaja pra config.MERCADO_MAPA_COMPRA sozinho).
+    if os.path.exists(COMPRAR_POCOES_E_SAIR_FLAG):
+        # CORRIGIDO 2026-07-22 (usuário: "pedido não encontrado ou
+        # corrompido" toda vez que tentava). O padrão copiado de
+        # VENDER_E_SAIR_FLAG/LER_INVENTARIO_E_SAIR_FLAG apaga o arquivo
+        # ANTES de chamar a função — certo pros outros 2 (são só um "1"
+        # de existência, não importa o conteúdo), mas ERRADO aqui: este
+        # flag carrega o JSON com tipo/quantidade, e a função só lia o
+        # conteúdo DEPOIS que o main() já tinha apagado o arquivo — ou
+        # seja, tentava ler um arquivo que ela mesma tinha acabado de
+        # apagar. Agora lê o payload PRIMEIRO e passa pronto pra função.
+        pedido = comprar_pocoes_pedido(COMPRAR_POCOES_E_SAIR_FLAG)
+        try:
+            os.remove(COMPRAR_POCOES_E_SAIR_FLAG)
+        except OSError:
+            pass
+        await _rodar_comprar_pocoes_e_sair(pedido)
+        return False
+
     # Limpa o pedido de 'Parar no fim' só num início DE VERDADE (clique no
     # Iniciar) — NUNCA num reinício automático (exit 42 por erro), senão um
     # pedido de parada feito pouco antes de um crash seria perdido e o bot
@@ -8567,37 +12199,173 @@ async def main():
     # de masmorra/caçada mais abaixo, cada um na sua vez).
     if not os.path.exists(SESSAO_CONTINUAR_FLAG):
         limpar_parar_no_fim()
+        limpar_sair_e_parar()
 
-    modo_caca_dupla = config.MODO_CONTEUDO == "caca_dupla"
-    modo_cripta = config.MODO_CONTEUDO == "cripta"
-    modo_caca_solo = config.MODO_CONTEUDO == "caca_solo"
-    modo_missao_oasis = config.MODO_CONTEUDO == "missao_oasis"
-    modo_templo_oasis = config.MODO_CONTEUDO == "templo_oasis"
-    modo_observador = config.MODO_CONTEUDO == "observador"
+    # 🧩 MULTI-CONTEÚDO (pedido do usuário 2026-07-22): se config.
+    # MULTI_CONTEUDO_ATIVO estiver ligado E GRUPOS_CONTEUDO preenchido,
+    # roda TODOS os grupos em paralelo, cada um com seu próprio modo/contas
+    # (ver _rodar_um_grupo). Os grupos podem continuar CONFIGURADOS no
+    # settings.json mesmo com MULTI_CONTEUDO_ATIVO desligado (o painel
+    # preserva a configuração ao desmarcar o checkbox, pedido do usuário
+    # 2026-07-23) — só ativa de verdade com os DOIS marcados. Sem isso
+    # (o caso de sempre), roda exatamente como antes: 1 conteúdo só.
+    grupos_conteudo = getattr(config, "GRUPOS_CONTEUDO", None) or []
+    if not (getattr(config, "MULTI_CONTEUDO_ATIVO", False) and grupos_conteudo):
+        return await _rodar_um_grupo()
+
+    log("bot", f"🧩 Multi-conteúdo: {len(grupos_conteudo)} grupo(s) configurado(s) "
+               f"— rodando todos em paralelo, no mesmo processo.")
+
+    def _contas_por_fone_do_modo(modo: str) -> dict:
+        """CORRIGIDO 2026-07-23 (usuário: "a caçada solo no mul conteúdo tá
+        bugado, tá usando pot de vida bem acima do %hp") — a causa raiz: o
+        despachante usava só config.ACCOUNTS (a aba 'chars' crua — nome/
+        telefone/papel/personagem), sem NENHUM dos ajustes específicos de
+        cada modo (HP%, mapa, item-alvo, tônico, etc.), que só existem nas
+        listas 'contas'/'grupos' de cada aba (config.CACA_SOLO, config.
+        MISSAO_OASIS, etc — já com os ajustes MESCLADOS pelo painel). Sem
+        isso, toda conta caía nos valores padrão genéricos (ex: HP% 40)
+        mesmo se o usuário tivesse configurado um valor diferente. Agora
+        prefere a entrada da lista ESPECÍFICA do modo (que já vem completa
+        — nome/telefone/papel + os ajustes); só cai pra config.ACCOUNTS crua
+        se a conta ainda não estiver configurada em nenhuma aba desse modo."""
+        lista_extra = []
+        if modo == "caca_solo":
+            lista_extra = config.CACA_SOLO.get("contas", [])
+        elif modo == "missao_oasis":
+            lista_extra = config.MISSAO_OASIS.get("contas", [])
+        elif modo == "cripta":
+            lista_extra = config.CRIPTA.get("contas", [])
+        elif modo == "fortaleza_orcs":
+            lista_extra = config.FORTALEZA_ORCS.get("contas", [])
+        elif modo == "observador":
+            lista_extra = config.OBSERVADOR.get("contas", [])
+        elif modo == "caca_dupla":
+            lista_extra = [c for g in (config.CACA_DUPLA.get("grupos", []) or []) for c in g]
+        elif modo == "templo_oasis":
+            lista_extra = [c for g in (config.TEMPLO_OASIS.get("grupos", []) or []) for c in g]
+        por_fone = {a.get("phone", "").strip(): a for a in config.ACCOUNTS if a.get("phone", "").strip()}
+        for c in lista_extra:
+            fone = (c.get("phone") or "").strip()
+            if fone:
+                por_fone[fone] = c   # sobrescreve com a versão COMPLETA (com os ajustes do modo)
+        return por_fone
+
+    async def _rodar_grupo_nomeado(i, grupo):
+        nome_grupo = grupo.get("nome") or f"Grupo {i + 1}"
+        modo_grupo = (grupo.get("modo") or "").strip()
+        contas_por_fone = _contas_por_fone_do_modo(modo_grupo)
+        fones_grupo = [f.strip() for f in (grupo.get("contas") or []) if f.strip()]
+        contas_grupo = [contas_por_fone[f] for f in fones_grupo if f in contas_por_fone]
+        faltando = [f for f in fones_grupo if f not in contas_por_fone]
+        if faltando:
+            log("bot", f"⚠️ Multi-conteúdo ({nome_grupo}): {len(faltando)} telefone(s) "
+                       f"não achado(s) em ACCOUNTS — {faltando}.")
+        if not modo_grupo or not contas_grupo:
+            log("bot", f"❌ Multi-conteúdo ({nome_grupo}): modo ou contas vazio(s) — pulando este grupo.")
+            return False
+        # 'caca_dupla'/'templo_oasis' exigem PARES (uma dupla = 2 contas) —
+        # divide a lista do grupo em pares consecutivos, na ordem dada.
+        grupos_pares = [contas_grupo[j:j + 2] for j in range(0, len(contas_grupo), 2)]
+        sufixo_grupo = re.sub(r"[^a-z0-9]+", "_", norm(nome_grupo)).strip("_") or f"g{i + 1}"
+        log("bot", f"🧩 Multi-conteúdo — iniciando '{nome_grupo}': modo={modo_grupo}, "
+                   f"{len(contas_grupo)} conta(s).")
+        try:
+            return await _rodar_um_grupo(
+                modo_conteudo_override=modo_grupo,
+                contas_override=contas_grupo,
+                grupos_cfg_override=(grupos_pares if modo_grupo in ("caca_dupla", "templo_oasis") else None),
+                grupos_cfg_templo_override=(grupos_pares if modo_grupo == "templo_oasis" else None),
+                sufixo=sufixo_grupo,
+            )
+        except Exception as e:
+            log("bot", f"💥 Multi-conteúdo ('{nome_grupo}'): erro não tratado — {e!r}. "
+                       f"Vou pedir reinício do processo (afeta todos os grupos).")
+            return True
+
+    resultados = await asyncio.gather(*(
+        _rodar_grupo_nomeado(i, g) for i, g in enumerate(grupos_conteudo)
+    ))
+    # 1 processo só (aceito pelo usuário) -> se QUALQUER grupo pedir
+    # reinício, o processo inteiro reinicia e retoma todos os grupos.
+    return any(resultados)
+
+
+async def _rodar_um_grupo(modo_conteudo_override=None, contas_override=None,
+                          grupos_cfg_override=None, grupos_cfg_templo_override=None,
+                          sufixo="") -> bool:
+    """Roda UM conteúdo (Masmorra/Caçada Dupla/Cripta/Solo/Missão Oásis/Templo
+    do Oásis/Fortaleza dos Orcs/Observador) até o fim — é o main() de sempre,
+    só que agora PARAMETRIZÁVEL (pedido do usuário 2026-07-22: "multi-
+    conteúdo" — rodar 2+ conteúdos diferentes ao mesmo tempo, no MESMO
+    processo, cada um com seu próprio grupo de contas).
+
+    Sem nenhum override (chamada padrão, 1 conteúdo só): comportamento
+    IDÊNTICO a antes — lê config.MODO_CONTEUDO e as contas configuradas na
+    aba daquele modo, exatamente como sempre foi. Com overrides (chamado
+    várias vezes em paralelo por main(), 1x por grupo do
+    config.GRUPOS_CONTEUDO): cada chamada roda seu PRÓPRIO modo com suas
+    PRÓPRIAS contas, isolada da(s) outra(s).
+
+    'sufixo': identifica o grupo pra namespacing de arquivo — hoje só o
+    baseline (contador "desde que iniciou") precisa disso, já que é o único
+    estado que é por-MODO (SESSAO_CONTINUAR_FLAG continua GLOBAL de
+    propósito: um erro que exige reiniciar o processo reinicia TODOS os
+    grupos juntos, já que é 1 processo só — aceito conscientemente pelo
+    usuário como trade-off do multi-conteúdo no mesmo processo em vez de
+    pastas separadas). O status.json (HP ao vivo) é compartilhado mas cada
+    grupo só mexe nas PRÓPRIAS contas (ver _status_limpar_contas) — não há
+    conflito mesmo sendo o mesmo arquivo."""
+    _baseline_file = SESSAO_BASELINE_FILE if not sufixo else \
+        os.path.join(APP_DIR, f"sessao_baseline_{sufixo}.txt")
+    _modo_atual = modo_conteudo_override if modo_conteudo_override is not None else config.MODO_CONTEUDO
+    modo_caca_dupla = _modo_atual == "caca_dupla"
+    modo_cripta = _modo_atual == "cripta"
+    modo_caca_solo = _modo_atual == "caca_solo"
+    modo_missao_oasis = _modo_atual == "missao_oasis"
+    modo_templo_oasis = _modo_atual == "templo_oasis"
+    modo_fortaleza_orcs = _modo_atual == "fortaleza_orcs"
+    modo_observador = _modo_atual == "observador"
+    # "masmorra" é o modo PADRÃO/implícito (qualquer MODO_CONTEUDO que não
+    # seja nenhum dos outros acima) — nunca tinha uma flag própria porque
+    # nada precisava checar isso explicitamente antes. BUG REAL corrigido
+    # 2026-07-20 (usuário: crash "NameError: name 'modo_masmorra' is not
+    # defined" — eu usei essa variável em 3 lugares novos sem nunca ter
+    # criado ela).
+    modo_masmorra = not (modo_caca_dupla or modo_cripta or modo_caca_solo
+                          or modo_missao_oasis or modo_templo_oasis
+                          or modo_fortaleza_orcs or modo_observador)
     # grupos_cfg: lista de duplas (cada uma = lista de 2 contas). Uma dupla =
     # uma caçada rodando sozinha; 2+ duplas = 2+ caçadas em paralelo, cada
     # uma na sua própria sala. contas_config é a lista ACHATADA (todas as
     # contas de todos os grupos) — usada só pra fazer login de todo mundo.
-    grupos_cfg = config.CACA_DUPLA.get("grupos", []) if modo_caca_dupla else []
+    grupos_cfg = grupos_cfg_override if grupos_cfg_override is not None else \
+        (config.CACA_DUPLA.get("grupos", []) if modo_caca_dupla else [])
     # mesma ideia pro Templo do Oásis (Duo) — grupos PRÓPRIOS, contador PRÓPRIO.
-    grupos_cfg_templo = config.TEMPLO_OASIS.get("grupos", []) if modo_templo_oasis else []
+    grupos_cfg_templo = grupos_cfg_templo_override if grupos_cfg_templo_override is not None else \
+        (config.TEMPLO_OASIS.get("grupos", []) if modo_templo_oasis else [])
     if modo_caca_dupla:
         contas_config = [acc for grupo in grupos_cfg for acc in grupo]
     elif modo_templo_oasis:
         contas_config = [acc for grupo in grupos_cfg_templo for acc in grupo]
     elif modo_cripta:
-        contas_config = config.CRIPTA.get("contas", [])
+        contas_config = contas_override if contas_override is not None else config.CRIPTA.get("contas", [])
+    elif modo_fortaleza_orcs:
+        contas_config = contas_override if contas_override is not None else config.FORTALEZA_ORCS.get("contas", [])
     elif modo_caca_solo:
-        contas_config = config.CACA_SOLO.get("contas", [])
+        contas_config = contas_override if contas_override is not None else config.CACA_SOLO.get("contas", [])
     elif modo_missao_oasis:
-        contas_config = config.MISSAO_OASIS.get("contas", [])
+        contas_config = contas_override if contas_override is not None else config.MISSAO_OASIS.get("contas", [])
     elif modo_observador:
-        contas_config = config.OBSERVADOR.get("contas", [])
+        contas_config = contas_override if contas_override is not None else config.OBSERVADOR.get("contas", [])
     else:
         # MASMORRA: entram só as contas marcadas como ATIVAS no painel (as
         # demais ficam logadas, só não participam). Sem o campo 'ativa'
-        # (save antigo) = ativa, por compatibilidade.
-        contas_config = [a for a in config.ACCOUNTS if a.get("ativa", True)]
+        # (save antigo) = ativa, por compatibilidade. Com contas_override
+        # (multi-conteúdo), usa a lista do grupo diretamente — já vem
+        # filtrada, sem precisar olhar 'ativa'.
+        contas_config = contas_override if contas_override is not None else \
+            [a for a in config.ACCOUNTS if a.get("ativa", True)]
 
     if modo_caca_dupla and not grupos_cfg:
         log("bot", "❌ Nenhuma dupla configurada na aba Caçada Dupla. "
@@ -8609,6 +12377,9 @@ async def main():
         return False
     if modo_cripta and not (1 <= len(contas_config) <= 5):
         log("bot", "❌ A Cripta precisa de 1 a 5 contas configuradas na aba Cripta.")
+        return False
+    if modo_fortaleza_orcs and not (1 <= len(contas_config) <= 5):
+        log("bot", "❌ A Fortaleza dos Orcs precisa de 1 a 5 contas configuradas na aba Fortaleza dos Orcs.")
         return False
     if modo_caca_solo and not contas_config:
         log("bot", "❌ Nenhuma conta configurada na aba Caçada Solo.")
@@ -8680,24 +12451,39 @@ async def main():
     # combate, reiniciou, e "os 2 saíram e foi criada uma nova sala" — a
     # causa era exatamente essa viagem genérica rodando primeiro).
     retomar_cripta = False
-    if modo_cripta:
+    if modo_cripta or modo_fortaleza_orcs:
         retomar_cripta = os.path.exists(SESSAO_CONTINUAR_FLAG) or await detectar_conteudo_ativo(sessions)
         if retomar_cripta:
-            log("bot", "▶️ Cripta ATIVA detectada — retomando de onde parou "
+            rotulo_retomada = "Cripta" if modo_cripta else "Fortaleza dos Orcs"
+            log("bot", f"▶️ {rotulo_retomada} ATIVA detectada — retomando de onde parou "
                        "(sem viajar nem limpar a conversa).")
 
     sessions_ja_em_combate = set()
-    if modo_caca_dupla or modo_templo_oasis:
+    if modo_caca_dupla or modo_templo_oasis or modo_masmorra:
         _ja_continuar = os.path.exists(SESSAO_CONTINUAR_FLAG)
         for s in sessions:
-            try:
-                await s.refresh()
-                if _ja_continuar or is_combat_screen(s.message):
-                    sessions_ja_em_combate.add(s.name)
-            except Exception:
-                pass
+            # BUG REAL corrigido 2026-07-20 (log do usuário: 4 contas já em
+            # combate, mas logo após reconectar o bot tentou viajar nelas
+            # mesmo assim — "não achei o botão 'Viajar'" — e isso disparou
+            # uma cadeia de telas travadas). A 1ª leitura logo depois de
+            # reconectar pode vir VELHA (mesmo problema que detectar_
+            # conteudo_ativo já tratava com 2 tentativas, pra Cripta/
+            # Fortaleza — só faltava aplicar aqui também). Agora tenta até
+            # 2 vezes antes de concluir que a conta NÃO está em combate.
+            em_combate = False
+            for _ in range(2):
+                try:
+                    await s.refresh()
+                    if is_combat_screen(s.message):
+                        em_combate = True
+                        break
+                except Exception:
+                    pass
+                await poll_sleep()
+            if _ja_continuar or em_combate:
+                sessions_ja_em_combate.add(s.name)
         if sessions_ja_em_combate:
-            rotulo = "Caçada em Dupla" if modo_caca_dupla else "Templo do Oásis"
+            rotulo = "Caçada em Dupla" if modo_caca_dupla else "Templo do Oásis" if modo_templo_oasis else "Masmorra"
             log("bot", f"▶️ {rotulo}: {len(sessions_ja_em_combate)} conta(s) já em "
                        f"combate ativo detectadas — pulando viagem pra elas (retomando).")
 
@@ -8712,6 +12498,7 @@ async def main():
     #    run_missao_oasis_conta (mesma ideia da Caçada Solo).
     #  - Masmorra -> usa o mapa escolhido no painel (ou fica onde está se vazio).
     destino = ("Cemitério Antigo" if modo_cripta
+               else "Fortaleza dos Orcs" if modo_fortaleza_orcs
                else config.CACA_MAPA if modo_caca_dupla
                else None if (modo_caca_solo or modo_missao_oasis or modo_observador)
                else config.MAPA_DESTINO)
@@ -8787,11 +12574,7 @@ async def main():
     if modo_cripta:
         log("bot", f"🚀 {len(sessions)} contas logadas. Rodando Cripta "
                    f"(Masmorra/Caçada desligadas — só um conteúdo por vez).")
-        try:
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-        except Exception:
-            pass
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
         continuar = os.path.exists(SESSAO_CONTINUAR_FLAG)
         if continuar:
             try:
@@ -8800,13 +12583,13 @@ async def main():
                 pass
         if continuar:
             try:
-                baseline = int(open(SESSAO_BASELINE_FILE).read().strip())
+                baseline = int(open(_baseline_file).read().strip())
             except Exception:
                 baseline = _ler_relatorio_total_cripta()
         else:
             baseline = _ler_relatorio_total_cripta()
             try:
-                with open(SESSAO_BASELINE_FILE, "w") as f:
+                with open(_baseline_file, "w") as f:
                     f.write(str(baseline))
             except Exception:
                 pass
@@ -8818,14 +12601,41 @@ async def main():
                 await s.client.disconnect()
         return bool(reiniciar)
 
+    if modo_fortaleza_orcs:
+        log("bot", f"🚀 {len(sessions)} contas logadas. Rodando Fortaleza dos Orcs "
+                   f"(Masmorra/Caçada/Cripta desligadas — só um conteúdo por vez).")
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
+        continuar = os.path.exists(SESSAO_CONTINUAR_FLAG)
+        if continuar:
+            try:
+                os.remove(SESSAO_CONTINUAR_FLAG)
+            except Exception:
+                pass
+        if continuar:
+            try:
+                baseline = int(open(_baseline_file).read().strip())
+            except Exception:
+                baseline = int((_ler_relatorio() or {}).get("fortaleza_orcs_total", 0))
+        else:
+            baseline = int((_ler_relatorio() or {}).get("fortaleza_orcs_total", 0))
+            try:
+                with open(_baseline_file, "w") as f:
+                    f.write(str(baseline))
+            except Exception:
+                pass
+        log("bot", f"📊 contando execuções da Fortaleza dos Orcs a partir de agora "
+                   f"(histórico atual: {baseline}).")
+        try:
+            reiniciar = await run_fortaleza_orcs(sessions, baseline, continuar, retomar_cripta)
+        finally:
+            for s in sessions:
+                await s.client.disconnect()
+        return bool(reiniciar)
+
     if modo_caca_solo:
         log("bot", f"🚀 {len(sessions)} conta(s) logada(s). Rodando Caçada Solo "
                    f"— cada uma sozinha, em paralelo (Masmorra/Caçada/Cripta desligadas).")
-        try:
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-        except Exception:
-            pass
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
         continuar = os.path.exists(SESSAO_CONTINUAR_FLAG)
         if continuar:
             try:
@@ -8833,13 +12643,13 @@ async def main():
             except Exception:
                 pass
             try:
-                baseline = int(open(SESSAO_BASELINE_FILE).read().strip())
+                baseline = int(open(_baseline_file).read().strip())
             except Exception:
                 baseline = _ler_relatorio_total_caca_solo()
         else:
             baseline = _ler_relatorio_total_caca_solo()
             try:
-                with open(SESSAO_BASELINE_FILE, "w") as f:
+                with open(_baseline_file, "w") as f:
                     f.write(str(baseline))
             except Exception:
                 pass
@@ -8854,11 +12664,7 @@ async def main():
     if modo_missao_oasis:
         log("bot", f"🚀 {len(sessions)} conta(s) logada(s). Rodando Missão Oásis "
                    f"— cada uma sozinha, em paralelo (Masmorra/Caçada/Cripta/Solo desligadas).")
-        try:
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-        except Exception:
-            pass
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
         continuar = os.path.exists(SESSAO_CONTINUAR_FLAG)
         if continuar:
             try:
@@ -8866,13 +12672,13 @@ async def main():
             except Exception:
                 pass
             try:
-                baseline = int(open(SESSAO_BASELINE_FILE).read().strip())
+                baseline = int(open(_baseline_file).read().strip())
             except Exception:
                 baseline = _ler_relatorio_total_missao_oasis()
         else:
             baseline = _ler_relatorio_total_missao_oasis()
             try:
-                with open(SESSAO_BASELINE_FILE, "w") as f:
+                with open(_baseline_file, "w") as f:
                     f.write(str(baseline))
             except Exception:
                 pass
@@ -8887,11 +12693,7 @@ async def main():
     if modo_observador:
         log("bot", f"👁️ {len(sessions)} conta(s) logada(s). Modo OBSERVADOR "
                    f"— só lendo, sem clicar em nada (Masmorra/Caçada/Cripta/Solo/Oásis desligados).")
-        try:
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-        except Exception:
-            pass
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
         try:
             reiniciar = await run_observador(sessions)
         finally:
@@ -8904,11 +12706,7 @@ async def main():
         log("bot", f"🚀 {len(sessions)} contas logadas. Rodando "
                    f"{n_grupos} Caçada(s) em Dupla em paralelo "
                    f"(Masmorra desligada — só um conteúdo por vez).")
-        try:
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-        except Exception:
-            pass
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
 
         # 'continuar' é GLOBAL (o reinício automático — exit 42 — relança o
         # processo inteiro, com TODAS as duplas juntas, não uma de cada vez).
@@ -8926,6 +12724,13 @@ async def main():
         for grupo in grupos_cfg:
             grupos_sessions.append(sessions[idx: idx + len(grupo)])
             idx += len(grupo)
+        # Marca cada sessão com o número da SUA dupla (pedido do usuário
+        # 2026-07-19: "agrupa a dupla 1 e a dupla 2" no /status do Telegram)
+        # — write_status() lê isso via getattr(s, "_dupla_num", None) e
+        # grava no status.json, pro Telegram separar as duas duplas.
+        for i, grupo_sessions in enumerate(grupos_sessions):
+            for s in grupo_sessions:
+                s._dupla_num = i + 1
 
         # baseline de CADA dupla: numa CONTINUAÇÃO (reinício automático) lê o
         # progresso salvo daquela dupla (o limite max_cacadas segue valendo);
@@ -8972,11 +12777,7 @@ async def main():
         log("bot", f"🚀 {len(sessions)} contas logadas. Rodando "
                    f"{n_grupos} Templo(s) do Oásis (Duo) em paralelo "
                    f"(Masmorra/Caçada/Cripta desligadas — só um conteúdo por vez).")
-        try:
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-        except Exception:
-            pass
+        _status_limpar_contas([a.get("name", "?") for a in contas_config])
 
         continuar = os.path.exists(SESSAO_CONTINUAR_FLAG)
         if continuar:
@@ -9037,22 +12838,18 @@ async def main():
         except Exception:
             pass
         try:
-            baseline = int(open(SESSAO_BASELINE_FILE).read().strip())
+            baseline = int(open(_baseline_file).read().strip())
         except Exception:
             baseline = _ler_relatorio_total()
     else:
         baseline = _ler_relatorio_total()
         try:
-            with open(SESSAO_BASELINE_FILE, "w") as f:
+            with open(_baseline_file, "w") as f:
                 f.write(str(baseline))
         except Exception:
             pass
     log("bot", f"📊 contando masmorras a partir de agora (histórico atual: {baseline}).")
-    try:
-        if os.path.exists(STATUS_FILE):
-            os.remove(STATUS_FILE)   # não mostra HP velho de uma execução anterior
-    except Exception:
-        pass
+    _status_limpar_contas([a.get("name", "?") for a in contas_config])
 
     shared = {
         "keys": {},                      # nome -> chaves lidas no ciclo
@@ -9075,9 +12872,28 @@ async def main():
     }
     barrier = asyncio.Barrier(len(sessions))
     n = len(sessions)
-    tasks = [asyncio.create_task(run_account(s, shared, barrier, n)) for s in sessions]
+    tasks = [asyncio.create_task(run_account(s, shared, barrier, n, retomando=(s.name in sessions_ja_em_combate)))
+             for s in sessions]
     try:
         await asyncio.gather(*tasks)
+        # REDE DE SEGURANÇA (2026-07-21, mesmo relato de "às vezes alguém
+        # não sai depois da morte"): antes de o processo encerrar DE VEZ,
+        # varre todas as contas uma última vez — quem ainda estiver na tela
+        # de combate (por QUALQUER caminho imprevisto que tenha pulado o
+        # leave_room) sai da sala agora. NÃO roda no reinício automático
+        # (restart), porque nesse caso o relançamento RETOMA a masmorra
+        # ativa — sair da sala aqui estragaria a retomada.
+        if not shared["restart"].is_set():
+            _nomes_sweep = [x.char for x in sessions if getattr(x, "char", None)]
+            for s in sessions:
+                try:
+                    await s.refresh()
+                    if is_combat_screen(s.message) or someone_died(s.text, _nomes_sweep):
+                        log(s.name, "🚪 varredura final: ainda dentro da sala — "
+                                    "saindo antes de desligar o bot.")
+                        await leave_room(s)
+                except Exception as e:
+                    log(s.name, f"(varredura final: não consegui checar/sair: {e!r})")
     finally:
         for s in sessions:
             await s.client.disconnect()

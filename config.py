@@ -34,7 +34,7 @@ def session_path(app_dir, phone, name=None):
 # VERSION: versão DESTE build. O botão "Verificar atualização" no painel
 # compara com a versão publicada no GitHub Releases e avisa se há uma mais nova.
 # BUMP MANUAL: subir este número a cada release (ex: 1.0.0 -> 1.0.1).
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 # UPDATE_REPO: repositório do GitHub no formato "usuario/repositorio" onde ficam
 # os Releases (com o zip de atualização anexado). Vazio = botão desativado.
 UPDATE_REPO = "trrolzinho/app-releases"
@@ -57,6 +57,22 @@ ACCOUNTS = [
     {"name": "arqueiro", "phone": "", "role": "arqueiro", "char_name": "", "host": False},
 ]
 
+# --- Bot de CONTROLE via Telegram (pedido do usuário 2026-07-17): um bot de
+# verdade (criado no @BotFather, com botões clicáveis de resposta — só bots
+# recebem callback_query de botão, contas normais não), rodando separado das
+# contas que jogam, num grupo/chat privado. Deixa ligar/pausar o bot, ver
+# status ao vivo e o relatório, sem precisar abrir o painel gráfico.
+# "CONTROLE_TELEGRAM_IDS": lista de IDs numéricos do Telegram autorizados a
+# mandar comando (populada pelo próprio bot quando alguém manda /registrar no
+# grupo — não dá pra vincular por telefone direto, um bot não enxerga o
+# telefone de quem manda mensagem, só o ID).
+CONTROLE_BOT_TOKEN = ""       # token do @BotFather (ex: "123456:ABC-DEF...")
+CONTROLE_TELEGRAM_IDS = []    # IDs autorizados (int), preenchido via /registrar
+CONTROLE_CHAT_ID = 0          # chat/grupo onde avisar sozinho se o bot cair
+                              # (pedido do usuário) — guardado automaticamente
+                              # na 1ª vez que alguém usa /registrar ou /menu
+                              # nesse grupo (ver telegram_controle.py).
+
 # --- Catálogo de TODAS as almas conhecidas por papel: (nome, recarga_em_turnos)
 # Fixas (constantes do jogo) — o painel não mexe na lista, só deixa marcar
 # quais delas cada CONTA realmente usa (settings.json -> ACCOUNTS[i]["souls"]).
@@ -64,10 +80,13 @@ ACCOUNTS = [
 # Pro tank, "Rugido do Rochedo" fica sempre em 1º: é o "provoca" que segura o
 # aggro no tank — prioridade não é por recarga aqui, é por função.
 SOULS_CATALOG = {
-    "tank":      [("Rugido do Rochedo", 4), ("Escudo de Ossos", 5)],
+    "tank":      [("Rugido do Rochedo", 4), ("Escudo de Ossos", 5), ("Muralha Orc", 5),
+                  ("Golpe do Obelisco", 5)],
     "suporte":   [("Escudo Arcano", 3), ("Vontade do Lich", 5), ("Orbe Solar", 5)],
-    "dps":       [("Tempestade de Areia", 6), ("Poder do Lich", 5), ("Maldição da Bruxa", 4)],
-    "arqueiro":  [("Flecha do Djinn", 7), ("Precisão Élfica", 6), ("Picada da Aranha", 4)],
+    "dps":       [("Tempestade de Areia", 6), ("Poder do Lich", 5), ("Maldição da Bruxa", 4),
+                  ("Chama de Guerra", 4)],
+    "arqueiro":  [("Flecha do Djinn", 7), ("Presa do Rastreador", 4), ("Precisão Élfica", 6),
+                  ("Picada da Aranha", 4)],
     "lanceiro":  [("Lança Solar", 6), ("Lança do Guardião", 4), ("Lança dos Ventos", 3)],
     "berserker": [("Fúria do Titã", 9), ("Golpe Sombrio", 4), ("Fúria do Lobo", 3)],
 }
@@ -153,6 +172,13 @@ TANK_RUGIDO_HP_MIN = 40   # % — abaixo disso, não usa Rugido (perigoso demais
                           #     melhor focar em curar)
 TANK_RUGIDO_HP_MAX = 90   # % — acima disso, não usa Rugido (HP já está bem,
                           #     sem necessidade de reforçar aggro agora)
+TANK_RUGIDO_PISO_AGGRO = 45  # % — piso do check cruzado de aggro (2 tanks):
+                              # quando o aggro caiu e ambos os tanks precisam
+                              # curar, o 1º tank lança o Rugido ANTES de curar
+                              # SE ainda estiver acima deste % (abaixo disso
+                              # a cura tem prioridade absoluta). Com 2 tanks,
+                              # 45% (~112 HP de 249) é seguro: o AoM vai todo
+                              # pro tank com aggro e o 2º tank cuida de curar.
 
 # --- Tempos -----------------------------------------------------------
 # ACTION_DELAY = pausa fixa depois de cada clique antes de checar a tela;
@@ -161,6 +187,17 @@ TANK_RUGIDO_HP_MAX = 90   # % — acima disso, não usa Rugido (HP já está bem
 # quanto menores, mais ágil é abrir menu/clicar (Almas, Consumíveis, poção...).
 ACTION_DELAY = 0.15
 UPDATE_TIMEOUT = 12.0
+# STATUS_WRITE_MIN_INTERVALO: mesmo sem uma rodada nova de combate fechar,
+# regrava o status.json (HP/monstro/progresso) se já fizer esse tempo desde
+# a última gravação — pedido do usuário 2026-07-19 ("bem lento a
+# atualização, tem como acelerar?", vendo 'dado de 36s atrás' no /status
+# pelo Telegram). Sem isso, uma conta numa rodada que demora muito pra
+# fechar (API do Telegram lenta, monstro com HP alto) deixava o status.json
+# parado no valor da rodada anterior por tempo indefinido. Baixar esse valor
+# deixa o /status mais em dia; ele já não pode ser baixo demais, porque toda
+# gravação é uma leitura+escrita SÍNCRONA do arquivo inteiro (ver write_status
+# no hunter.py) — muito frequente volta a travar o loop com várias contas.
+STATUS_WRITE_MIN_INTERVALO = 5.0
 # ACTION_CONFIRM = espera CURTA usada só pro clique da AÇÃO de combate na caçada
 # (Atacar/Defender/alma/poção). Depois de agir, a tela da caçada só muda quando
 # a RODADA resolve — não faz sentido o bot travar até UPDATE_TIMEOUT (12s)
@@ -207,6 +244,21 @@ MAX_TENTATIVAS_ACAO = 10
 # 10-18s com 1.5s e 5 contas). Se usar MENOS contas ao mesmo tempo, pode
 # baixar de novo (ex: 1.0-1.2s pra 2-3 contas).
 POLL_INTERVAL = 2.0
+# START_COOLDOWN_SEG: intervalo MÍNIMO entre um '/start' e o próximo, pra
+# MESMA conta. BUG REAL / BANIMENTO CONFIRMADO EM PRODUÇÃO (2026-07-18): o
+# usuário foi banido depois do bot mandar VÁRIOS '/start' em sequência bem
+# rápida pra mesma conta (ver send_start() no hunter.py) — o '/start' é
+# sempre o ÚLTIMO recurso de loops de retry (ex: open_masmorra), e como
+# ACTION_DELAY (acima) é de só 0.15s — calibrado pra ser ágil DEPOIS de um
+# clique normal, não pra proteger o '/start' — um loop de 5 tentativas podia
+# mandar 4-5 '/start' em poucos segundos se o jogo demorasse mais que isso
+# pra processar o comando e mostrar o menu de novo. O Telegram trata rajada
+# de comandos repetidos como flood/spam DO BOT e bane a conta que manda,
+# não o bot em si. Agora send_start() nunca manda um novo '/start' antes
+# desse tempo ter passado desde o último — se chamado de novo cedo demais,
+# só espera o resto do cooldown e dá mais uma chance de refresh, SEM mandar
+# outro '/start'.
+START_COOLDOWN_SEG = 20.0
 # POLL_JITTER: variação ALEATÓRIA (± segundos) somada ao POLL_INTERVAL a cada
 # consulta (ver poll_sleep() no hunter.py). SEM isso, com várias contas rodando
 # em paralelo, todas dormem o MESMO tempo fixo e acordam no MESMO instante —
@@ -223,6 +275,12 @@ LOBBY_TIMEOUT = 180.0
 MAX_ROUNDS = 500
 TONICO_INTERVALO = 600   # segundos entre usos do Super Tônico (recarga ~10 min)
 ELIXIR_INTERVALO = 1800  # segundos entre usos do Super Elixir de Sabedoria (dura ~30 min)
+# Limiar de HP% (0-1) do boss ATUAL abaixo do qual o elixir é liberado quando
+# a conta está configurada com elixir_modo="boss" (ver try_elixir em
+# hunter.py) — pedido do usuário 2026-07-24: usar o elixir só quando o boss
+# tá quase morto, pra render praticamente os 30 min inteiros do buff de +XP
+# depois do fim da masmorra, em vez de gastar boa parte dele durante ela.
+ELIXIR_BOSS_HP_PCT = 0.01
 
 # STATUS_AO_VIVO_ATIVO: liga/desliga a gravação do status.json (o painel de
 # "Status ao vivo" — HP, andar, cronômetro). Desligado = write_status() nem
@@ -293,15 +351,30 @@ MERCADO_DELAY_CONFIRMACAO_SEG = 10.0
 # Miragens) — se a conta estiver em um destes, o bot nem tenta clicar em
 # "Loja" aqui, já viaja direto pro MERCADO_MAPA_VENDA (mais rápido).
 MERCADO_MAPAS_SEM_MERCADOR = ["Oásis Perdido"]
+# Compra de poções (pedido do usuário 2026-07-21: "pra comprar você move o
+# personagem pro mapa da Planície e faz a compra lá") — diferente da venda
+# (que só viaja se o mapa atual não tiver mercador), a compra SEMPRE viaja
+# pra este mapa fixo antes de comprar, do jeito que o usuário faz manualmente.
+MERCADO_MAPA_COMPRA = "Planície"
+
+# Debugs de investigação (dumps de tela crua, "HP não lido", etc.) —
+# desligados por padrão (pedido do usuário 2026-07-22: "tem como tirar os
+# debugs? acho que não tem mais nenhum bug... e eles só estão poluindo os
+# logs"). Se precisar investigar algo de novo, liga via settings.json
+# ("LOG_DEBUG_VERBOSE": true) — não precisa mexer em código nem pedir uma
+# correção nova só pra reativar o log.
+LOG_DEBUG_VERBOSE = False
 
 # --- Abas do painel escondidas (pedido do usuário 2026-07-15: "vou passar o
 # programa pra um colega") --------------------------------------------------
 # Some com abas inteiras do painel (a função continua funcionando por baixo
 # dos panos se já estiver configurada — só o ATALHO visual some). Valores
-# aceitos na lista: "mercado", "observador". Lista vazia = mostra tudo (padrão).
-# Exemplo pra esconder as duas antes de repassar pra alguém:
-#   PAINEL_ABAS_OCULTAS = []
-PAINEL_ABAS_OCULTAS = []
+# aceitos na lista: "mercado", "observador", "multi". Lista vazia = mostra
+# tudo (padrão).
+# ESTA É A VERSÃO PRA DISTRIBUIR PROS AMIGOS (pedido do usuário 2026-07-25:
+# "adicionei uns conteúdos que ainda não quero disponibilizar") — Multi-
+# conteúdo escondido de propósito (ainda em teste na versão principal).
+PAINEL_ABAS_OCULTAS = ["multi"]
 
 # Quantas masmorras fazer e então PARAR (0 = sem limite, roda pra sempre).
 MAX_DUNGEONS = 0
@@ -378,7 +451,72 @@ MASMORRAS_ALTERNATIVAS = {
         "skin_por_raca": True,
         "skin_unica": "osíris",
     },
+    "covil_do_lord": {
+        "rotulo": "Covil do Lord",
+        # Cemitério Antigo tem 2 masmorras (print do usuário 2026-07-20):
+        # "Covil do Lord" (esta) e "Cripta do Cemitério" — a 2ª já é a
+        # Cripta de sempre (outro MODO_CONTEUDO inteiro, não mexe aqui).
+        # SEM skin — só precisa da "Chave do Ossuário" (comprada na Loja da
+        # Cripta com Pó de Ossos; ver _falta_chave_ossuario/host_create_room
+        # — se faltar, o bot pausa avisando, não tenta comprar sozinho,
+        # mesmo padrão de Chaves de Masmorra normais). Até 5 contas (não 4
+        # — sem limite fixo no código, o próprio jogo decide).
+        "botao": "covil do lord",
+        "mapa": "Cemitério Antigo",
+        # BUG REAL corrigido 2026-07-20 (usuário: "ele identifica a chave
+        # de masmorra, que não é essa que usa"): diferente das Chaves de
+        # Masmorra normais (mostradas no menu principal), a "Chave do
+        # Ossuário" fica ESCONDIDA em Inventário -> Ferramentas -> às
+        # vezes só na 2ª página. Esse campo avisa o código pra usar
+        # ler_chave_especial_inventario() em vez de read_keys_at_menu()
+        # na hora de decidir quem vira host (ver main()).
+        "chave_inventario": "Chave do Ossuário",
+    },
+    # --- MINAS ABANDONADAS NAS MONTANHAS (pedido do usuário 2026-07-21) ---
+    # 3 masmorras IGUAIS (só muda o nível) no mapa Montanhas Gélidas:
+    # Menu -> Masmorra abre a tela "Minas Abandonadas nas Montanhas" com os
+    # 3 botões — clicar num deles JÁ CRIA a sala (sem tela de senha, até 5
+    # membros). Chave própria: "Chave das Minas" (Inventário -> Ferramentas,
+    # consumida SÓ pelo líder ao iniciar). 3 mobs + boss (Varkrul, o Frio
+    # Eterno, 3 fases); XP/gold/drop só na tela final "— COMPLETA!" (por
+    # isso 'marcador_fim'/'resultado_final'). Sem skin. Sala sem senha =
+    # risco de INTRUSO: o host confere os membros antes de Iniciar e recria
+    # a sala se entrar gente de fora (ver host_start no hunter.py).
+    "minas_azulgor": {
+        "rotulo": "Ruínas de Azulgor (Lv42)",
+        "botao": "ruínas de azulgor",
+        "mapa": "Montanhas Gélidas",
+        "chave_inventario": "Chave das Minas",
+        "sem_senha": True,
+        "marcador_fim": "completa",
+        "resultado_final": True,
+    },
+    "minas_kryos": {
+        "rotulo": "Lago de Kryos (Lv44)",
+        "botao": "lago de kryos",
+        "mapa": "Montanhas Gélidas",
+        "chave_inventario": "Chave das Minas",
+        "sem_senha": True,
+        "marcador_fim": "completa",
+        "resultado_final": True,
+    },
+    "minas_tuneis": {
+        "rotulo": "Túneis Proibidos (Lv46)",
+        "botao": "túneis proibidos",
+        "mapa": "Montanhas Gélidas",
+        "chave_inventario": "Chave das Minas",
+        "sem_senha": True,
+        "marcador_fim": "completa",
+        "resultado_final": True,
+    },
 }
+
+# ESTA É A VERSÃO PRA DISTRIBUIR PROS AMIGOS (pedido do usuário 2026-07-25) —
+# desliga o "Especial das Minas" (força Rugido do Rochedo no aviso de "Zero
+# Absoluto em carga" do boss das Minas Abandonadas nas Montanhas, ver
+# _act_tank no hunter.py), ainda em teste na versão principal. A masmorra da
+# montanha continua disponível normalmente, só sem esse comportamento extra.
+MINAS_ESPECIAL_RUGIDO_ATIVO = False
 
 # Papel -> RAÇA do personagem (Lanceiro e Arqueiro são a MESMA raça no jogo,
 # só com equipamento diferente — por isso caem na mesma variante de skin).
@@ -417,7 +555,26 @@ TIPO_MASMORRA = "normal"
 #     "Elmo Sombrio": "epico",
 #     "Anel do Vazio": "lendario",
 # }
-ITENS_RARIDADE = {}
+ITENS_RARIDADE = {
+    # Almas da Fortaleza dos Orcs (pedido do usuário 2026-07-21: "no drop
+    # ela tá como bolinha branca, no lugar da laranja" — a tela de Equipar
+    # já mostra a bolinha certa (🟠 = lendário), mas o EVENTO de drop da
+    # Alma ("Nome obteve Item (ALMA)") não mostra bolinha nenhuma, então o
+    # bot nunca tinha como descobrir a raridade sozinho — só cadastrando
+    # na mão mesmo, igual o catálogo já previa).
+    "Muralha Orc": "lendario",     # alma de tank
+    "Chama de Guerra": "lendario",  # alma de dps
+    # Totem Obscuro (pedido do usuário 2026-07-23: "notei que o bot não
+    # detecta o totem, e ele tem essa raridade" + print confirmando a
+    # bolinha 🟡 amarela na tela de Usar) — dropa na Caçada Solo em
+    # Montanhas Gélidas e nas Minas de lá (Ruínas de Azulgor/Lago de
+    # Kryos/Túneis Proibidos). MESMO bug de fundo das Almas acima: a tela
+    # de drop ("Fulano encontrou um Totem Obscuro!") não mostra raridade
+    # nenhuma — só itens LENDÁRIOS ganham o "(lendário)" entre parênteses
+    # nessa tela; os de raridade mais baixa (como este, Épico) não, então
+    # só cadastrando na mão mesmo.
+    "Totem Obscuro": "epico",
+}
 
 MAPAS_CONHECIDOS = ["Planície", "Floresta Sombria", "Pântano", "Cemitério Antigo",
                     "Deserto Escaldante", "Oásis Perdido", "Montanhas Gélidas", "Abismo"]
@@ -440,6 +597,40 @@ CRIPTA = {
     "contas": [],            # contas escolhidas p/ a Cripta (2 a 5) — vêm do painel
 }
 
+# --- FORTALEZA DOS ORCS (pedido do usuário 2026-07-20) --------------------
+# Conteúdo em GRUPO (1 a 5 contas), no mapa "Fortaleza dos Orcs". Parecido
+# com a Cripta na FORMAÇÃO da sala (SEM senha — todo mundo só marca Pronto,
+# sem precisar de código/senha manual), mas DIFERENTE no formato: não é
+# infinito — são sempre 3 salas + 1 sala de BOSS, e termina SOZINHO quando
+# aparece a tela "... — COMPLETA!" (o bot não precisa de um "andar máximo"
+# configurado, o próprio conteúdo já para na hora certa).
+# PRÉ-REQUISITO (as 2 variantes exigem a MESMA skin equipada pra entrar — o
+# bot confere e equipa sozinho antes de tentar formar a sala, ver
+# garantir_skin_fortaleza() no hunter.py):
+#   "tipo": "fosso_de_provas"  -> Fosso de Provas (Grupo, Lv46+)
+#   "tipo": "trono_khargath"   -> Trono de Khar'gath (Grupo, Lv48+)
+# A skin NÃO é campo editável no painel de propósito (pedido do usuário:
+# "deixar essa opção de digitar o nome abre mt brecha para bugs") — mesmo
+# padrão já usado em MASMORRAS_ALTERNATIVAS (Zul'gor/Viadin/Hidra/Ossos),
+# onde a skin exigida também é fixa no código, nunca digitada por ninguém.
+# SEM sufixo "(F)"/"(M)" de propósito (confirmado pelo usuário 2026-07-20:
+# é a MESMA skin pra todo mundo — só varia a versão feminina/masculina,
+# puramente visual, sem efeito nenhum). Como garantir_skin_fortaleza()
+# procura o botão por SUBSTRING, deixando sem o sufixo aqui casa com
+# "Equipar Pele de Goblin (F)" OU "(M)", sem precisar saber qual delas
+# cada conta usa.
+# LISTA (não uma só) — confirmado pelo usuário 2026-07-20: "Pele de Orc"
+# TAMBÉM serve pra entrar na Fortaleza dos Orcs, além de "Pele de Goblin".
+# Se a conta já tiver QUALQUER uma das duas equipada, já tá valendo — só
+# equipa se não tiver NENHUMA das duas (nesse caso, usa a que a conta já
+# possuir e conseguir equipar).
+FORTALEZA_ORCS_SKINS = ["Pele de Goblin", "Pele de Orc"]
+FORTALEZA_ORCS = {
+    "tipo": "fosso_de_provas",     # "fosso_de_provas" | "trono_khargath"
+    "max_execucoes": 0,      # quantas vezes rodar e então PARAR (0 = sem limite)
+    "contas": [],            # contas escolhidas (1 a 5) — vêm do painel
+}
+
 # --- POÇÕES da CRIPTA (config própria, independente da Caçada em Dupla) ----
 # A Caçada em Dupla mantém os PRÓPRIOS campos de poção dentro de CACA_DUPLA
 # (não mexemos nisso). Este bloco aqui é só pra CRIPTA. A Masmorra não usa
@@ -455,6 +646,24 @@ POCOES = {
     "reforco_pct": 0,
     "pocao_vida_minima": 10,
     "pocao_vida_aviso": 100,
+    # Compra automática (pedido do usuário 2026-07-23: "ao identificar isso,
+    # já ir comprar a pot? já que já tem o caminho do mercado") — OPCIONAL,
+    # desligado por padrão (envolve gastar gold sozinho, sem confirmação).
+    # Só age no aviso de ANTES DE INICIAR (poção baixa detectada antes de
+    # começar a masmorra/caçada/cripta/etc) — não tenta comprar durante o
+    # combate (precisaria sair da sala pra viajar até a loja, mais arriscado).
+    "comprar_automatico": False,
+    "reabastecer_ate": 250,   # quantas Poções de Vida deixar em estoque após comprar
+    # Mesma ideia, agora pra Poção de Energia (pedido do usuário 2026-07-23:
+    # "nas caçadas, solo e em dupla e missão do oásis, tem como fazer isso,
+    # só que com as pot de energia?") — Caçada Solo/Dupla/Missão Oásis
+    # bebem Poção de Energia do INVENTÁRIO quando a energia do personagem
+    # fica baixa; quando o ESTOQUE dela acaba, hoje só pausa. Com isso
+    # ligado, tenta comprar um lote antes de desistir. Preço bem mais alto
+    # que a de Vida (5000 gold cada, visto em print do usuário) — por isso
+    # um alvo bem menor por padrão.
+    "comprar_energia_automatico": False,
+    "energia_comprar_qtd": 20,   # quantas comprar de uma vez quando o estoque acabar
 }
 
 # --- CAÇADA SOLO (cada conta caça sozinha, em paralelo, sem sala/parceiro) --
@@ -494,6 +703,22 @@ CACA_SOLO = {
                              # False. Só aparece/faz efeito quando o mapa dessa
                              # conta é "Floresta Profunda" — ver BOSS_FLORESTA_
                              # PROFUNDA/MOBS_FLORESTA_PROFUNDA logo abaixo.
+                             # "FUGIR DO BOSS" em MONTANHAS GÉLIDAS é POR CONTA
+                             # também (pedido do usuário 2026-07-19, mesmo
+                             # princípio da Floresta Profunda): contas[i]
+                             # ["fugir_boss_montanha"] = True/False. Só aparece/
+                             # faz efeito quando o mapa dessa conta é
+                             # "Montanhas Gélidas" — ver BOSS_MONTANHAS_GELIDAS
+                             # logo abaixo.
+                             # "SÓ COLAR DA PAZ" em CEMITÉRIO ANTIGO é POR CONTA
+                             # também (pedido do usuário 2026-07-21): contas[i]
+                             # ["cemiterio_so_colar"] = True/False — foge de todo
+                             # mob normal, só espera o NPC 'Coveiro Huaguilli'
+                             # (vende o Colar da Paz) aparecer. O bot SEMPRE
+                             # compra o Colar quando esse NPC aparece, com ou
+                             # sem esse modo ligado (ver is_coveiro_huaguilli_
+                             # solo/tratar_evento_solo no hunter.py) — esse
+                             # campo só liga o modo de EVITAR combate normal.
     "contas": [],            # contas que caçam sozinhas (cada uma independente)
 }
 
@@ -572,11 +797,24 @@ OBSERVADOR = {
 
 # Monstros conhecidos de Montanhas Gélidas (pro painel oferecer um HP% por
 # monstro nessa aba). Só é usado se o mapa escolhido for "Montanhas Gélidas".
+# O Boss ("Grimmrok, o Eterno Inverno") fica de FORA desta lista — ver
+# BOSS_MONTANHAS_GELIDAS logo abaixo, que tem o filtro próprio de "fugir do
+# boss" (mesmo padrão do Boss da Floresta Profunda).
 MOBS_MONTANHAS_GELIDAS = [
     "Serpente de Cristal", "Urso Glacial", "Aranha de Cristal", "Lince Sombrio",
-    "Grimmrok, o Eterno Inverno", "Troll das Fendas", "Caçador Polar",
-    "Corvo de Tempestade", "Espectro das Neves",
+    "Troll das Fendas", "Caçador Polar", "Corvo de Tempestade", "Espectro das Neves",
+    "Golem de Avalanche",
 ]
+
+# Boss de Montanhas Gélidas — usado pelo filtro "Fugir do Boss" da Caçada Solo
+# (contas[i]["fugir_boss_montanha"] = True, pedido do usuário 2026-07-19,
+# mesmo princípio de BOSS_FLORESTA_PROFUNDA): com ele ligado, a conta foge SÓ
+# deste boss (nome tem que bater com o que aparece no jogo — comparação
+# ignora maiúscula/acento/espaço, ver norm() em hunter.py) e continua
+# lutando normal com os monstros comuns do mapa. Desligado (padrão) = luta
+# com tudo, igual antes. Só tem efeito em Montanhas Gélidas — em qualquer
+# outro mapa, ignora esse campo.
+BOSS_MONTANHAS_GELIDAS = "Grimmrok, o Eterno Inverno"
 
 # Monstros conhecidos da FLORESTA PROFUNDA (sub-área de Floresta Sombria —
 # ver comentário em CACA_SOLO["mapa"] acima) — pro painel oferecer um HP%
@@ -613,6 +851,32 @@ BOSS_FLORESTA_PROFUNDA = "Abominação do Aspecto Caído"
 # próprio andar/combate). Os ajustes abaixo (andar_maximo, energia_minima
 # etc.) valem igualmente pra TODOS os grupos.
 MODO_CONTEUDO = "masmorra"
+
+# 🧩 MULTI-CONTEÚDO (pedido do usuário 2026-07-22: "tem como fazer o bot
+# fazer mais de 1 conteúdo por vez?") — lista de grupos, cada um com seu
+# PRÓPRIO modo e suas PRÓPRIAS contas, todos rodando em PARALELO no MESMO
+# processo. Cada item: {"nome": "...", "modo": "masmorra"|"caca_dupla"|
+# "cripta"|"caca_solo"|"missao_oasis"|"templo_oasis"|"fortaleza_orcs"|
+# "observador", "contas": ["+55...", "+55..."]} — os telefones precisam
+# bater com os já cadastrados em ACCOUNTS (nome/personagem/papel/almas
+# continuam vindo de lá; aqui só se decide QUAL modo cada conta roda).
+# Pra "caca_dupla"/"templo_oasis", as contas do grupo são divididas em
+# pares consecutivos (1ª+2ª = dupla 1, 3ª+4ª = dupla 2, etc.).
+# VAZIA (padrão): comportamento de sempre — só MODO_CONTEUDO acima, com as
+# contas de cada aba normal (Masmorra/Caçada Dupla/etc.), nada muda.
+# IMPORTANTE (aceito conscientemente pelo usuário, ver hunter.py
+# _rodar_um_grupo): como é 1 processo só, um erro que exige REINICIAR
+# reinicia TODOS os grupos juntos — não é por-grupo. Pra isolamento total
+# entre grupos (1 crash não afeta o outro), a alternativa é usar pastas
+# separadas (uma instância do bot por pasta) em vez desta configuração.
+GRUPOS_CONTEUDO = []
+# Ativação explícita do multi-conteúdo (pedido do usuário 2026-07-23: "ideal
+# um checkbox para ativar o multiconteúdo e desativar os demais") — os
+# GRUPOS_CONTEUDO acima podem continuar CONFIGURADOS na tela mesmo com isso
+# desligado (não perde a configuração ao desmarcar); só quando os DOIS
+# estão verdadeiros (ativo=True E grupos não-vazios) o hunter.py usa o
+# multi-conteúdo de verdade — ver main() em hunter.py.
+MULTI_CONTEUDO_ATIVO = False
 CACA_DUPLA = {
     "andar_maximo": 49,      # ao alcançar esse andar, sai da caçada e recomeça
     "energia_minima": 10,    # se sobrar menos que isso ao voltar, bebe poção
@@ -645,18 +909,19 @@ _SETTINGS_PATH = os.path.join(_app_dir(), "settings.json")
 def _carregar_settings():
     global API_ID, API_HASH, BOT_USERNAME, SALA_SENHA, ACCOUNTS, MAX_DUNGEONS
     global TANK_HEAL_RATIO, TANK_CRITICAL_RATIO, OTHER_HEAL_RATIO, BETWEEN_DG_HEAL_RATIO
-    global TANK_RUGIDO_HP_MIN, TANK_RUGIDO_HP_MAX
-    global MODO_CONTEUDO, CACA_DUPLA, MAPA_DESTINO, TIPO_MASMORRA
-    global CRIPTA, POCOES
+    global TANK_RUGIDO_HP_MIN, TANK_RUGIDO_HP_MAX, TANK_RUGIDO_PISO_AGGRO
+    global MODO_CONTEUDO, GRUPOS_CONTEUDO, MULTI_CONTEUDO_ATIVO, CACA_DUPLA, MAPA_DESTINO, TIPO_MASMORRA
+    global CRIPTA, POCOES, FORTALEZA_ORCS
     global CACA_SOLO, MISSAO_OASIS
     global TEMPLO_OASIS, MAPA_TEMPLO_OASIS
     global MASMORRA_POCAO_VIDA_MINIMA, MASMORRA_POCAO_VIDA_AVISO
     global MANUTENCAO_ATIVA, MANUTENCAO_INICIO, MANUTENCAO_FIM
     global MEDIA_JANELA
     global MERCADO_ATIVO, MERCADO_INTERVALO_MIN, MERCADO_REFORCOS, MERCADO_ITENS, MERCADO_CONTAS
-    global MERCADO_MAPA_VENDA
+    global MERCADO_MAPA_VENDA, MERCADO_MAPA_COMPRA, LOG_DEBUG_VERBOSE
     global MERCADO_MAPAS_SEM_MERCADOR
     global PAINEL_ABAS_OCULTAS
+    global CONTROLE_BOT_TOKEN, CONTROLE_TELEGRAM_IDS, CONTROLE_CHAT_ID
     if not os.path.exists(_SETTINGS_PATH):
         return
     try:
@@ -704,6 +969,10 @@ def _carregar_settings():
         TANK_RUGIDO_HP_MAX = int(s.get("TANK_RUGIDO_HP_MAX", TANK_RUGIDO_HP_MAX))
     except (TypeError, ValueError):
         pass
+    try:
+        TANK_RUGIDO_PISO_AGGRO = int(s.get("TANK_RUGIDO_PISO_AGGRO", TANK_RUGIDO_PISO_AGGRO))
+    except (TypeError, ValueError):
+        pass
     MANUTENCAO_ATIVA = bool(s.get("MANUTENCAO_ATIVA", MANUTENCAO_ATIVA))
     if isinstance(s.get("MANUTENCAO_INICIO"), str):
         MANUTENCAO_INICIO = s["MANUTENCAO_INICIO"]
@@ -729,13 +998,36 @@ def _carregar_settings():
         MERCADO_CONTAS = [str(x) for x in s["MERCADO_CONTAS"]]
     if isinstance(s.get("MERCADO_MAPA_VENDA"), str) and s.get("MERCADO_MAPA_VENDA", "").strip():
         MERCADO_MAPA_VENDA = s["MERCADO_MAPA_VENDA"].strip()
+    if isinstance(s.get("MERCADO_MAPA_COMPRA"), str) and s.get("MERCADO_MAPA_COMPRA", "").strip():
+        MERCADO_MAPA_COMPRA = s["MERCADO_MAPA_COMPRA"].strip()
+    if isinstance(s.get("LOG_DEBUG_VERBOSE"), bool):
+        LOG_DEBUG_VERBOSE = s["LOG_DEBUG_VERBOSE"]
     if isinstance(s.get("MERCADO_MAPAS_SEM_MERCADOR"), list):
         MERCADO_MAPAS_SEM_MERCADOR = [str(x) for x in s["MERCADO_MAPAS_SEM_MERCADOR"]]
     if isinstance(s.get("PAINEL_ABAS_OCULTAS"), list):
         PAINEL_ABAS_OCULTAS = [str(x) for x in s["PAINEL_ABAS_OCULTAS"]]
+    if isinstance(s.get("CONTROLE_BOT_TOKEN"), str):
+        CONTROLE_BOT_TOKEN = s["CONTROLE_BOT_TOKEN"].strip()
+    if isinstance(s.get("CONTROLE_TELEGRAM_IDS"), list):
+        _ids = []
+        for x in s["CONTROLE_TELEGRAM_IDS"]:
+            try:
+                _ids.append(int(x))
+            except (TypeError, ValueError):
+                pass
+        CONTROLE_TELEGRAM_IDS = _ids
+    if isinstance(s.get("CONTROLE_CHAT_ID"), (int, float)):
+        try:
+            CONTROLE_CHAT_ID = int(s["CONTROLE_CHAT_ID"])
+        except (TypeError, ValueError):
+            pass
     if s.get("MODO_CONTEUDO") in ("masmorra", "caca_dupla", "cripta", "caca_solo",
-                                   "missao_oasis", "templo_oasis"):
+                                   "missao_oasis", "templo_oasis", "fortaleza_orcs"):
         MODO_CONTEUDO = s["MODO_CONTEUDO"]
+    if isinstance(s.get("GRUPOS_CONTEUDO"), list):
+        GRUPOS_CONTEUDO = s["GRUPOS_CONTEUDO"]
+    if isinstance(s.get("MULTI_CONTEUDO_ATIVO"), bool):
+        MULTI_CONTEUDO_ATIVO = s["MULTI_CONTEUDO_ATIVO"]
     cd = s.get("CACA_DUPLA")
     if isinstance(cd, dict):
         novo = dict(CACA_DUPLA)
@@ -786,15 +1078,33 @@ def _carregar_settings():
         if isinstance(cr.get("contas"), list):
             novo["contas"] = cr["contas"]
         CRIPTA = novo
+    fo = s.get("FORTALEZA_ORCS")
+    if isinstance(fo, dict):
+        novo = dict(FORTALEZA_ORCS)
+        if fo.get("tipo") in ("fosso_de_provas", "trono_khargath"):
+            novo["tipo"] = fo["tipo"]
+        if "max_execucoes" in fo:
+            try:
+                novo["max_execucoes"] = int(fo["max_execucoes"])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(fo.get("contas"), list):
+            novo["contas"] = fo["contas"]
+        FORTALEZA_ORCS = novo
     pc = s.get("POCOES")
     if isinstance(pc, dict):
         novo = dict(POCOES)
-        for k in ("vida_min_pct", "reforco_pct", "pocao_vida_minima", "pocao_vida_aviso"):
+        for k in ("vida_min_pct", "reforco_pct", "pocao_vida_minima", "pocao_vida_aviso",
+                  "reabastecer_ate", "energia_comprar_qtd"):
             if k in pc:
                 try:
                     novo[k] = int(pc[k])
                 except (TypeError, ValueError):
                     pass
+        if isinstance(pc.get("comprar_automatico"), bool):
+            novo["comprar_automatico"] = pc["comprar_automatico"]
+        if isinstance(pc.get("comprar_energia_automatico"), bool):
+            novo["comprar_energia_automatico"] = pc["comprar_energia_automatico"]
         POCOES = novo
     cs = s.get("CACA_SOLO")
     if isinstance(cs, dict):
